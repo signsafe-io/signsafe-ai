@@ -151,6 +151,7 @@ async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
                     "clause_id": c["id"],
                     "contract_id": contract_id,
                     "label": c.get("label"),
+                    "content": c["content"][:500],  # truncated for RAG snippet display
                     "org_id": None,  # org_id populated later via contract lookup
                     "created_at": now_ts.isoformat(),
                     "created_at_ts": now_ts.timestamp(),
