@@ -1,4 +1,5 @@
 """Database connection and helper functions using asyncpg."""
+
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -74,6 +75,28 @@ async def update_ingestion_job(
         status=status,
         progress=progress,
     )
+
+
+# ---------------------------------------------------------------------------
+# Contract helpers
+# ---------------------------------------------------------------------------
+
+
+async def update_contract_status(
+    pool: asyncpg.Pool,
+    contract_id: str,
+    status: str,
+) -> None:
+    """Update contracts.status column."""
+    now = datetime.now(timezone.utc)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE contracts SET status = $1, updated_at = $2 WHERE id = $3",
+            status,
+            now,
+            contract_id,
+        )
+    log.info("contract status updated", contract_id=contract_id, status=status)
 
 
 # ---------------------------------------------------------------------------
