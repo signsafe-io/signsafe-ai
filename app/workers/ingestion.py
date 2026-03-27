@@ -19,6 +19,7 @@ Processing pipeline:
     9. Job status → completed, progress 100%
    10. On failure → job status failed, store error message
 """
+
 from __future__ import annotations
 
 import os
@@ -35,6 +36,7 @@ import structlog
 
 from app.db import (
     insert_clauses_batch,
+    update_contract_status,
     update_ingestion_job,
 )
 from app.services import embeddings as emb_svc
@@ -163,6 +165,7 @@ async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
         await update_ingestion_job(
             pool, job_id, status="completed", progress=100, current_step="완료"
         )
+        await update_contract_status(pool, contract_id, "ready")
         log.info("ingestion completed", job_id=job_id, contract_id=contract_id)
 
     finally:
@@ -204,6 +207,7 @@ def make_handler(
                     progress=0,
                     error_message=str(exc),
                 )
+                await update_contract_status(pool, contract_id, "failed")
             except Exception:
                 log.exception("failed to update job status to failed", job_id=job_id)
             raise  # re-raise so aio-pika nacks → DLQ
