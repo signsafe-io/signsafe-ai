@@ -36,6 +36,7 @@ import structlog
 
 from app.db import (
     insert_clauses_batch,
+    update_contract_status,
     update_ingestion_job,
 )
 from app.services import embeddings as emb_svc
