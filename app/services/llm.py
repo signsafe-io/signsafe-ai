@@ -1,4 +1,5 @@
 """LLM service: clause risk analysis using Anthropic Claude API."""
+
 from __future__ import annotations
 
 import json
@@ -74,10 +75,10 @@ def _extract_json(text: str) -> dict[str, Any]:
 def _normalize_risk_level(value: str) -> str:
     normalized = value.strip().upper()
     if normalized in ("HIGH", "MEDIUM", "LOW"):
-        return normalized.lower()
+        return normalized
     # Fallback mapping for unexpected values.
-    mapping = {"높음": "high", "중간": "medium", "낮음": "low"}
-    return mapping.get(value.strip(), "medium")
+    mapping = {"높음": "HIGH", "중간": "MEDIUM", "낮음": "LOW"}
+    return mapping.get(value.strip(), "MEDIUM")
 
 
 async def analyze_clause(clause_text: str) -> ClauseAnalysisResult:
@@ -96,10 +97,12 @@ async def analyze_clause(clause_text: str) -> ClauseAnalysisResult:
     try:
         data = _extract_json(raw_text)
     except (json.JSONDecodeError, AttributeError) as exc:
-        log.warning("LLM returned non-JSON response", error=str(exc), raw=raw_text[:200])
+        log.warning(
+            "LLM returned non-JSON response", error=str(exc), raw=raw_text[:200]
+        )
         # Return safe defaults on parse failure.
         return ClauseAnalysisResult(
-            risk_level="medium",
+            risk_level="MEDIUM",
             issue_types=[],
             summary="분석 결과를 파싱하지 못했습니다.",
             rationale=raw_text,
