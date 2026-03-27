@@ -17,6 +17,7 @@ Processing pipeline:
     4. Analysis status completed
     5. On failure → status failed
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -111,7 +112,9 @@ async def _analyze_single_clause(
                 "clause_result_id": clause_result_id,
                 "rationale": llm_result.rationale,
                 "citations": citations,
-                "recommended_actions": _build_recommended_actions(llm_result.issue_types),
+                "recommended_actions": _build_recommended_actions(
+                    llm_result.issue_types
+                ),
                 "top_k": 3,
                 "filter_params": {},
             },
@@ -164,12 +167,33 @@ async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
     log.info("loaded clauses", count=len(clauses))
 
     # Step 3 — parallel analysis with bounded concurrency.
+    # Use return_exceptions=True so a single clause failure does not abort others.
     semaphore = asyncio.Semaphore(_MAX_CONCURRENCY)
     tasks = [
         _analyze_single_clause(pool, analysis_id, clause, semaphore)
         for clause in clauses
     ]
-    await asyncio.gather(*tasks)
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Log per-clause failures but do not propagate; partial results are acceptable.
+    failed_count = 0
+    for clause, result in zip(clauses, results):
+        if isinstance(result, BaseException):
+            failed_count += 1
+            log.error(
+                "clause analysis failed",
+                clause_id=clause["id"],
+                analysis_id=analysis_id,
+                error=str(result),
+            )
+
+    if failed_count:
+        log.warning(
+            "analysis completed with clause failures",
+            analysis_id=analysis_id,
+            failed=failed_count,
+            total=len(clauses),
+        )
 
     # Step 4 — mark completed.
     await update_risk_analysis(
