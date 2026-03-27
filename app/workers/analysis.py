@@ -72,13 +72,17 @@ async def _analyze_single_clause(
         )
 
         # Build citations from similar clauses.
+        # Field names must match the frontend Citation TypeScript interface:
+        # id, type, title, snippet, whyRelevant, source?, score?
         citations = [
             {
-                "clause_id": s.get("clause_id"),
-                "contract_id": s.get("contract_id"),
-                "label": s.get("label"),
-                "score": s.get("score"),
+                "id": s.get("clause_id") or "",
+                "type": "clause",
+                "title": s.get("label") or "Similar clause",
                 "snippet": s.get("payload", {}).get("content", "")[:200],
+                "whyRelevant": "",
+                "source": s.get("contract_id"),
+                "score": s.get("score"),
             }
             for s in similar
         ]
