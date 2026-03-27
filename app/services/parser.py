@@ -9,6 +9,7 @@
 3. 헤더가 없는 경우 빈 줄 기준 단락 분절 후 의미 단위 병합
 4. 최소 길이 30자, 최대 길이 3000자로 조항 크기 제어
 """
+
 from __future__ import annotations
 
 import io
@@ -171,6 +172,12 @@ def _parse_pdf(data: bytes) -> list[Clause]:
         page = doc[page_idx]
         page_num = page_idx + 1
 
+        # Page dimensions for normalizing coordinates to 0-1 fractions.
+        # The frontend (RiskOverlay.tsx) expects normalized coordinates that
+        # it multiplies by the rendered page size.
+        page_width = page.rect.width or 1.0
+        page_height = page.rect.height or 1.0
+
         # Extract text blocks with position info.
         blocks = page.get_text("blocks")  # (x0, y0, x1, y1, text, block_no, block_type)
         for block in blocks:
@@ -178,11 +185,12 @@ def _parse_pdf(data: bytes) -> list[Clause]:
             text = text.strip()
             if not text:
                 continue
+            # Normalize coordinates to [0, 1] relative to the page dimensions.
             anchor = Anchor(
-                x=float(x0),
-                y=float(y0),
-                width=float(x1 - x0),
-                height=float(y1 - y0),
+                x=float(x0) / page_width,
+                y=float(y0) / page_height,
+                width=float(x1 - x0) / page_width,
+                height=float(y1 - y0) / page_height,
             )
             paragraphs.append((text, page_num, anchor))
 
