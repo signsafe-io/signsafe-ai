@@ -223,8 +223,12 @@ def _parse_docx(data: bytes) -> list[Clause]:
 # ---------------------------------------------------------------------------
 
 
-async def parse(file_path: Path) -> list[Clause]:
-    """Parse a PDF or DOCX file and return a list of Clause objects."""
+def parse_sync(file_path: Path) -> list[Clause]:
+    """Parse a PDF or DOCX file synchronously and return a list of Clause objects.
+
+    This is the canonical implementation. Use this function directly when running
+    in a thread (e.g. via asyncio.run_in_executor) to avoid blocking the event loop.
+    """
     data = file_path.read_bytes()
     suffix = file_path.suffix.lower()
 
@@ -239,3 +243,16 @@ async def parse(file_path: Path) -> list[Clause]:
 
     log.info("parsing complete", clause_count=len(clauses))
     return clauses
+
+
+async def parse(file_path: Path) -> list[Clause]:
+    """Async shim — kept for backward compatibility.
+
+    Prefer calling ``parse_sync`` via ``loop.run_in_executor`` so that the
+    synchronous C library (PyMuPDF) does not block the event loop.
+    """
+    import asyncio
+    import functools
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, functools.partial(parse_sync, file_path))

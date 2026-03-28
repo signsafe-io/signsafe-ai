@@ -22,6 +22,8 @@ Processing pipeline:
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import os
 import pathlib
 import tempfile
@@ -34,6 +36,7 @@ import asyncpg
 import boto3
 import structlog
 
+from app.config import settings
 from app.db import (
     get_org_id_for_contract,
     insert_clauses_batch,
@@ -43,7 +46,6 @@ from app.db import (
 from app.services import embeddings as emb_svc
 from app.services import parser as parser_svc
 from app.services import rag as rag_svc
-from app.config import settings
 
 log = structlog.get_logger()
 
@@ -87,11 +89,19 @@ async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
         tmp_path = pathlib.Path(tmp.name)
 
     try:
-        _download_file(file_path, tmp_path)
+        # Offload blocking network I/O to a thread so the event loop
+        # (shared with the analysis worker) is not blocked during download.
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None, functools.partial(_download_file, file_path, tmp_path)
+        )
         log.info("file downloaded", path=str(tmp_path), size=tmp_path.stat().st_size)
 
-        # Step 2 — parse
-        clauses = await parser_svc.parse(tmp_path)
+        # Step 2 — parse (CPU-bound + sync C library; offload to thread pool
+        # to avoid blocking the event loop shared with the analysis worker)
+        clauses = await loop.run_in_executor(
+            None, functools.partial(parser_svc.parse_sync, tmp_path)
+        )
         log.info("parsing complete", clause_count=len(clauses))
 
         # Step 3 → chunking
