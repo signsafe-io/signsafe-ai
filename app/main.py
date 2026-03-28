@@ -1,4 +1,5 @@
 import asyncio
+import signal
 import sys
 
 import structlog
@@ -41,11 +42,39 @@ async def main() -> None:
 
     log.info("connections established, starting workers")
 
-    try:
-        await asyncio.gather(
+    loop = asyncio.get_running_loop()
+    shutdown_event = asyncio.Event()
+
+    def _request_shutdown(sig: int) -> None:
+        log.info("shutdown signal received, stopping workers", signal=sig)
+        shutdown_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, _request_shutdown, sig)
+
+    # Run consumers until a shutdown signal is received.
+    # asyncio.gather is cancelled when shutdown_event fires so that
+    # in-flight aio-pika message handlers finish naturally (aio-pika
+    # drains pending acks before closing the channel).
+    gather_task = asyncio.ensure_future(
+        asyncio.gather(
             consume(queue_conn, INGESTION_QUEUE, ingestion_handler),
             consume(queue_conn, ANALYSIS_QUEUE, analysis_handler),
         )
+    )
+
+    try:
+        # Block until either a signal fires or the consumers exit on their own.
+        done, _ = await asyncio.wait(
+            {gather_task, asyncio.ensure_future(shutdown_event.wait())},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if shutdown_event.is_set() and not gather_task.done():
+            gather_task.cancel()
+            try:
+                await gather_task
+            except (asyncio.CancelledError, Exception):
+                pass
     finally:
         await queue_conn.close()
         await db.close()
