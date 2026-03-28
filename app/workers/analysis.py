@@ -30,6 +30,7 @@ import structlog
 
 from app.db import (
     get_clauses_for_contract,
+    get_org_id_for_analysis,
     insert_clause_result,
     insert_evidence_set,
     update_risk_analysis,
@@ -52,6 +53,7 @@ async def _analyze_single_clause(
     analysis_id: str,
     clause: asyncpg.Record,
     semaphore: asyncio.Semaphore,
+    org_id: str | None = None,
 ) -> None:
     """Run LLM + RAG for one clause and persist results."""
     async with semaphore:
@@ -65,10 +67,13 @@ async def _analyze_single_clause(
         # LLM analysis.
         llm_result = await analyze_clause(clause_text)
 
-        # RAG: find similar clauses.
+        # RAG: find similar clauses scoped to the same organization.
+        # Passing org_id ensures we only surface evidence from the org's own
+        # historical contracts, preventing cross-tenant data leakage.
         similar = await rag_svc.search_similar_clauses(
             query_text=clause_text,
             top_k=3,
+            org_id=org_id,
         )
 
         # Build citations from similar clauses.
@@ -174,11 +179,19 @@ async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
 
     log.info("loaded clauses", count=len(clauses))
 
+    # Fetch org_id to scope RAG search to this organization only.
+    org_id = await get_org_id_for_analysis(pool, analysis_id)
+    if org_id is None:
+        log.warning(
+            "org_id not found for analysis — RAG will search across all orgs",
+            analysis_id=analysis_id,
+        )
+
     # Step 3 — parallel analysis with bounded concurrency.
     # Use return_exceptions=True so a single clause failure does not abort others.
     semaphore = asyncio.Semaphore(_MAX_CONCURRENCY)
     tasks = [
-        _analyze_single_clause(pool, analysis_id, clause, semaphore)
+        _analyze_single_clause(pool, analysis_id, clause, semaphore, org_id=org_id)
         for clause in clauses
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)

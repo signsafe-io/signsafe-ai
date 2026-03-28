@@ -82,6 +82,37 @@ async def update_ingestion_job(
 # ---------------------------------------------------------------------------
 
 
+async def get_org_id_for_contract(
+    pool: asyncpg.Pool,
+    contract_id: str,
+) -> str | None:
+    """Return the organization_id for a contract, or None if not found."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT organization_id FROM contracts WHERE id = $1",
+            contract_id,
+        )
+    return row["organization_id"] if row else None
+
+
+async def get_org_id_for_analysis(
+    pool: asyncpg.Pool,
+    analysis_id: str,
+) -> str | None:
+    """Return the organization_id for a risk analysis via contract join."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT c.organization_id
+            FROM risk_analyses ra
+            JOIN contracts c ON c.id = ra.contract_id
+            WHERE ra.id = $1
+            """,
+            analysis_id,
+        )
+    return row["organization_id"] if row else None
+
+
 async def update_contract_status(
     pool: asyncpg.Pool,
     contract_id: str,
