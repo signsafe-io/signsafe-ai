@@ -1,4 +1,5 @@
 """Message queue connection and helpers using aio-pika (RabbitMQ)."""
+
 from __future__ import annotations
 
 import json
@@ -15,6 +16,9 @@ log = structlog.get_logger()
 # Queue names — must match signsafe-api declarations
 INGESTION_QUEUE = "ingestion.jobs"
 ANALYSIS_QUEUE = "analysis.jobs"
+
+INGESTION_DLQ = f"{INGESTION_QUEUE}.dlq"
+ANALYSIS_DLQ = f"{ANALYSIS_QUEUE}.dlq"
 
 
 async def connect_queue() -> aio_pika.abc.AbstractRobustConnection:
@@ -43,6 +47,40 @@ async def _declare_queue_with_dlq(
         },
     )
     return queue
+
+
+async def consume_dlq(
+    connection: aio_pika.abc.AbstractRobustConnection,
+    dlq_name: str,
+) -> None:
+    """Consume messages from a DLQ and log each one as an error.
+
+    DLQ messages represent processing failures. This consumer ensures they are
+    never silently accumulated — every entry is logged so operators can triage.
+    """
+    channel = await connection.channel()
+    await channel.set_qos(prefetch_count=1)
+
+    # DLQ is a plain durable queue (no dead-letter on the DLQ itself).
+    queue = await channel.declare_queue(dlq_name, durable=True)
+
+    log.info("starting DLQ consumer", queue=dlq_name)
+
+    async with queue.iterator() as messages:
+        async for message in messages:
+            async with message.process(requeue=False):
+                try:
+                    body_str = message.body.decode(errors="replace")
+                    headers = dict(message.headers or {})
+                    log.error(
+                        "DLQ message received — manual intervention required",
+                        queue=dlq_name,
+                        body=body_str[:500],
+                        headers=headers,
+                        message_id=message.message_id,
+                    )
+                except Exception:
+                    log.exception("failed to log DLQ message", queue=dlq_name)
 
 
 async def consume(
