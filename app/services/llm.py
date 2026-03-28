@@ -2,19 +2,29 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass
 from typing import Any
 
 import structlog
-from anthropic import AsyncAnthropic
+from anthropic import APIStatusError, AsyncAnthropic
+from tenacity import (
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from app.config import settings
 
 log = structlog.get_logger()
 
 MODEL = "claude-3-5-sonnet-20241022"
+
+# Timeout in seconds for a single LLM API call.
+_LLM_CALL_TIMEOUT = 60.0
 
 _client: AsyncAnthropic | None = None
 
@@ -24,6 +34,13 @@ def _get_client() -> AsyncAnthropic:
     if _client is None:
         _client = AsyncAnthropic(api_key=settings.anthropic_api_key)
     return _client
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """Return True for Anthropic 429 (rate limit) and 503 (overloaded) errors."""
+    if isinstance(exc, APIStatusError):
+        return exc.status_code in (429, 503)
+    return False
 
 
 _ANALYSIS_PROMPT_TEMPLATE = """계약서 조항을 분석하여 리스크를 평가해주세요.
@@ -81,18 +98,46 @@ def _normalize_risk_level(value: str) -> str:
     return mapping.get(value.strip(), "MEDIUM")
 
 
+@retry(
+    retry=retry_if_exception(_is_retryable),
+    wait=wait_exponential(multiplier=1, min=2, max=30),
+    stop=stop_after_attempt(3),
+    reraise=True,
+)
+async def _call_llm(client: AsyncAnthropic, prompt: str) -> str:
+    """Call Claude API with timeout and retry on 429/503."""
+    message = await asyncio.wait_for(
+        client.messages.create(
+            model=MODEL,
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}],
+        ),
+        timeout=_LLM_CALL_TIMEOUT,
+    )
+    return message.content[0].text
+
+
 async def analyze_clause(clause_text: str) -> ClauseAnalysisResult:
     """Run LLM risk analysis on a single clause and return structured result."""
     client = _get_client()
     prompt = _ANALYSIS_PROMPT_TEMPLATE.format(clause_text=clause_text)
 
-    message = await client.messages.create(
-        model=MODEL,
-        max_tokens=1024,
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    raw_text = message.content[0].text
+    try:
+        raw_text = await _call_llm(client, prompt)
+    except TimeoutError:
+        log.error(
+            "LLM call timed out",
+            timeout=_LLM_CALL_TIMEOUT,
+            clause_preview=clause_text[:100],
+        )
+        raise
+    except APIStatusError as exc:
+        log.error(
+            "LLM API error after retries",
+            status_code=exc.status_code,
+            clause_preview=clause_text[:100],
+        )
+        raise
 
     try:
         data = _extract_json(raw_text)
