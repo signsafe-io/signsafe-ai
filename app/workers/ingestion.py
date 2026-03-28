@@ -35,6 +35,7 @@ import boto3
 import structlog
 
 from app.db import (
+    get_org_id_for_contract,
     insert_clauses_batch,
     update_contract_status,
     update_ingestion_job,
@@ -139,6 +140,14 @@ async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
         # Ensure Qdrant collection exists.
         await rag_svc.ensure_collection()
 
+        # Look up the organization ID so Qdrant payloads can be filtered per org.
+        org_id = await get_org_id_for_contract(pool, contract_id)
+        if org_id is None:
+            log.warning(
+                "org_id not found for contract — Qdrant points will have null org_id",
+                contract_id=contract_id,
+            )
+
         # Generate embeddings in batches.
         texts = [c["content"] for c in clause_dicts]
         vectors = await emb_svc.embed(texts)
@@ -152,7 +161,7 @@ async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
                     "contract_id": contract_id,
                     "label": c.get("label"),
                     "content": c["content"][:500],  # truncated for RAG snippet display
-                    "org_id": None,  # org_id populated later via contract lookup
+                    "org_id": org_id,
                     "created_at": now_ts.isoformat(),
                     "created_at_ts": now_ts.timestamp(),
                 },
