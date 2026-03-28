@@ -13,6 +13,7 @@ dependencies = [
   "boto3>=1.34",
   "pydantic-settings>=2.0",
   "structlog>=24.0",
+  "tenacity>=8.2",
 ]
 
 [build-system]

@@ -41,6 +41,8 @@ from app.services.llm import MODEL, analyze_clause
 log = structlog.get_logger()
 
 _MAX_CONCURRENCY = 5
+# Total timeout per clause: LLM (60 s) + RAG + DB writes.
+_CLAUSE_TIMEOUT = 120.0
 
 
 def _new_id() -> str:
@@ -64,8 +66,22 @@ async def _analyze_single_clause(
 
         log.info("analyzing clause", clause_id=clause_id, label=label)
 
-        # LLM analysis.
-        llm_result = await analyze_clause(clause_text)
+        # LLM analysis with per-clause total timeout.
+        # analyze_clause() already applies a 60 s call-level timeout; this outer
+        # guard covers the full pipeline (LLM + RAG + DB) to prevent a semaphore
+        # slot from being occupied indefinitely.
+        try:
+            llm_result = await asyncio.wait_for(
+                analyze_clause(clause_text), timeout=_CLAUSE_TIMEOUT
+            )
+        except TimeoutError:
+            log.error(
+                "clause analysis timed out",
+                clause_id=clause_id,
+                analysis_id=analysis_id,
+                timeout=_CLAUSE_TIMEOUT,
+            )
+            raise
 
         # RAG: find similar clauses scoped to the same organization.
         # Passing org_id ensures we only surface evidence from the org's own
