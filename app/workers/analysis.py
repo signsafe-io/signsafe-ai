@@ -212,9 +212,30 @@ async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
 def make_handler(
     pool: asyncpg.Pool,
 ) -> Callable[[dict[str, Any]], Awaitable[None]]:
-    """Return an async message handler bound to the given DB pool."""
+    """Return an async message handler bound to the given DB pool.
+
+    Handles two message types on analysis.jobs:
+      1. Analysis jobs: {"contractId": "...", "analysisId": "..."}
+      2. RETRIEVE_EVIDENCE: {"type": "RETRIEVE_EVIDENCE", "evidenceSetId": "...", ...}
+
+    RETRIEVE_EVIDENCE messages are acknowledged and ignored here because the
+    actual retrieval logic (re-running RAG) is not yet implemented as a background
+    step — evidence is already populated during the initial analysis pass. Silently
+    dropping the message prevents the queue from being poisoned with unhandled types.
+    """
 
     async def handler(msg: dict[str, Any]) -> None:
+        # Route by message type. RETRIEVE_EVIDENCE messages are sent to this
+        # queue by evidenceSvc.RetrieveEvidence and must not be processed as
+        # analysis jobs (they lack contractId/analysisId fields).
+        msg_type = msg.get("type")
+        if msg_type == "RETRIEVE_EVIDENCE":
+            log.info(
+                "RETRIEVE_EVIDENCE message received and acknowledged (no-op)",
+                evidence_set_id=msg.get("evidenceSetId"),
+            )
+            return
+
         analysis_id = msg.get("analysisId", "unknown")
         contract_id = msg.get("contractId", "unknown")
         try:
