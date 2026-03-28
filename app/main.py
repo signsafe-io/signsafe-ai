@@ -1,4 +1,5 @@
 import asyncio
+import sys
 
 import structlog
 
@@ -9,7 +10,23 @@ from app.queue import ANALYSIS_QUEUE, INGESTION_QUEUE, connect_queue, consume
 log = structlog.get_logger()
 
 
+def _validate_config() -> None:
+    """Fail fast if required API keys are missing."""
+    missing: list[str] = []
+    if not settings.anthropic_api_key:
+        missing.append("ANTHROPIC_API_KEY")
+    if not settings.openai_api_key:
+        missing.append("OPENAI_API_KEY")
+    if missing:
+        log.error(
+            "required API keys are not set — cannot start worker",
+            missing=missing,
+        )
+        sys.exit(1)
+
+
 async def main() -> None:
+    _validate_config()
     log.info("signsafe-ai worker starting", env=settings.env)
 
     db = await connect_db()
