@@ -156,6 +156,10 @@ async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
     # Step 1 — mark running.
     await update_risk_analysis(pool, analysis_id, status="running")
 
+    # Ensure Qdrant collection exists before running RAG searches.
+    # This handles the case where Qdrant restarts and the collection is gone.
+    await rag_svc.ensure_collection()
+
     # Step 2 — load clauses.
     clauses = await get_clauses_for_contract(pool, contract_id)
     if not clauses:
