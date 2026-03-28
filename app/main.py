@@ -6,7 +6,15 @@ import structlog
 
 from app.config import settings
 from app.db import connect_db
-from app.queue import ANALYSIS_QUEUE, INGESTION_QUEUE, connect_queue, consume
+from app.queue import (
+    ANALYSIS_DLQ,
+    ANALYSIS_QUEUE,
+    INGESTION_DLQ,
+    INGESTION_QUEUE,
+    connect_queue,
+    consume,
+    consume_dlq,
+)
 
 log = structlog.get_logger()
 
@@ -52,7 +60,7 @@ async def main() -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, _request_shutdown, sig)
 
-    # Run consumers until a shutdown signal is received.
+    # Run main consumers and DLQ monitors until a shutdown signal is received.
     # asyncio.gather is cancelled when shutdown_event fires so that
     # in-flight aio-pika message handlers finish naturally (aio-pika
     # drains pending acks before closing the channel).
@@ -60,6 +68,8 @@ async def main() -> None:
         asyncio.gather(
             consume(queue_conn, INGESTION_QUEUE, ingestion_handler),
             consume(queue_conn, ANALYSIS_QUEUE, analysis_handler),
+            consume_dlq(queue_conn, INGESTION_DLQ),
+            consume_dlq(queue_conn, ANALYSIS_DLQ),
         )
     )
 
