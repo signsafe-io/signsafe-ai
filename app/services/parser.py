@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import io
 import re
 from dataclasses import dataclass
@@ -251,8 +253,5 @@ async def parse(file_path: Path) -> list[Clause]:
     Prefer calling ``parse_sync`` via ``loop.run_in_executor`` so that the
     synchronous C library (PyMuPDF) does not block the event loop.
     """
-    import asyncio
-    import functools
-
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, functools.partial(parse_sync, file_path))

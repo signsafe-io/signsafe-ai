@@ -72,6 +72,88 @@ def _guess_suffix(file_path: str) -> str:
     return ext.lower() if ext else ".pdf"
 
 
+def _clause_id_to_qdrant_id(clause_id: str) -> str:
+    """Convert a 26-char alphanumeric ID to a UUID string for Qdrant.
+
+    Qdrant requires point IDs to be unsigned integers or UUID strings.
+    We pad/hash to produce a deterministic UUID.
+    """
+    return str(uuid.uuid5(uuid.NAMESPACE_OID, clause_id))
+
+
+async def _download_and_parse(
+    loop: asyncio.AbstractEventLoop,
+    file_path: str,
+    tmp_path: pathlib.Path,
+) -> list[Any]:
+    """Download file from S3 and parse it into raw clauses."""
+    await loop.run_in_executor(
+        None, functools.partial(_download_file, file_path, tmp_path)
+    )
+    log.info("file downloaded", path=str(tmp_path), size=tmp_path.stat().st_size)
+
+    # CPU-bound + sync C library; offload to thread pool to avoid blocking
+    # the event loop shared with the analysis worker.
+    clauses = await loop.run_in_executor(
+        None, functools.partial(parser_svc.parse_sync, tmp_path)
+    )
+    log.info("parsing complete", clause_count=len(clauses))
+    return clauses
+
+
+def _build_clause_dicts(
+    clauses: list[Any],
+    created_at: datetime,
+) -> list[dict[str, Any]]:
+    """Convert parsed Clause objects to DB-ready dicts with generated IDs."""
+    clause_dicts: list[dict[str, Any]] = []
+    for idx, clause in enumerate(clauses):
+        cid = str(uuid.uuid4()).replace("-", "")[:26]
+        clause_dicts.append(
+            {
+                "id": cid,
+                "clause_index": idx,
+                "label": clause.label,
+                "content": clause.text,
+                "page_start": clause.page_start,
+                "page_end": clause.page_end,
+                "anchor_x": clause.anchor.x if clause.anchor else None,
+                "anchor_y": clause.anchor.y if clause.anchor else None,
+                "anchor_width": clause.anchor.width if clause.anchor else None,
+                "anchor_height": clause.anchor.height if clause.anchor else None,
+                "start_offset": clause.start_offset,
+                "end_offset": clause.end_offset,
+            }
+        )
+    return clause_dicts
+
+
+def _build_qdrant_points(
+    clause_dicts: list[dict[str, Any]],
+    vectors: list[list[float]],
+    contract_id: str,
+    org_id: str | None,
+    created_at: datetime,
+) -> list[dict[str, Any]]:
+    """Assemble Qdrant point dicts from clause dicts and embedding vectors."""
+    return [
+        {
+            "id": _clause_id_to_qdrant_id(c["id"]),
+            "vector": vectors[i],
+            "payload": {
+                "clause_id": c["id"],
+                "contract_id": contract_id,
+                "label": c.get("label"),
+                "content": c["content"][:500],  # truncated for RAG snippet display
+                "org_id": org_id,
+                "created_at": created_at.isoformat(),
+                "created_at_ts": created_at.timestamp(),
+            },
+        }
+        for i, c in enumerate(clause_dicts)
+    ]
+
+
 async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
     contract_id: str = msg["contractId"]
     job_id: str = msg["jobId"]
@@ -89,22 +171,10 @@ async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
         tmp_path = pathlib.Path(tmp.name)
 
     try:
-        # Offload blocking network I/O to a thread so the event loop
-        # (shared with the analysis worker) is not blocked during download.
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None, functools.partial(_download_file, file_path, tmp_path)
-        )
-        log.info("file downloaded", path=str(tmp_path), size=tmp_path.stat().st_size)
+        clauses = await _download_and_parse(loop, file_path, tmp_path)
 
-        # Step 2 — parse (CPU-bound + sync C library; offload to thread pool
-        # to avoid blocking the event loop shared with the analysis worker)
-        clauses = await loop.run_in_executor(
-            None, functools.partial(parser_svc.parse_sync, tmp_path)
-        )
-        log.info("parsing complete", clause_count=len(clauses))
-
-        # Step 3 → chunking
+        # Step 2 → chunking
         await update_ingestion_job(
             pool,
             job_id,
@@ -113,32 +183,13 @@ async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
             current_step="조항 분절 완료, DB 저장 중",
         )
 
-        # Build clause dicts with ULID-style IDs.
         now_ts = datetime.now(timezone.utc)
-        clause_dicts: list[dict[str, Any]] = []
-        for idx, clause in enumerate(clauses):
-            cid = str(uuid.uuid4()).replace("-", "")[:26]
-            clause_dicts.append(
-                {
-                    "id": cid,
-                    "clause_index": idx,
-                    "label": clause.label,
-                    "content": clause.text,
-                    "page_start": clause.page_start,
-                    "page_end": clause.page_end,
-                    "anchor_x": clause.anchor.x if clause.anchor else None,
-                    "anchor_y": clause.anchor.y if clause.anchor else None,
-                    "anchor_width": clause.anchor.width if clause.anchor else None,
-                    "anchor_height": clause.anchor.height if clause.anchor else None,
-                    "start_offset": clause.start_offset,
-                    "end_offset": clause.end_offset,
-                }
-            )
+        clause_dicts = _build_clause_dicts(clauses, now_ts)
 
         await insert_clauses_batch(pool, contract_id, clause_dicts)
         log.info("clauses saved to DB", count=len(clause_dicts))
 
-        # Step 4 → indexing
+        # Step 3 → indexing
         await update_ingestion_job(
             pool,
             job_id,
@@ -147,10 +198,8 @@ async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
             current_step="임베딩 생성 및 Qdrant 저장 중",
         )
 
-        # Ensure Qdrant collection exists.
         await rag_svc.ensure_collection()
 
-        # Look up the organization ID so Qdrant payloads can be filtered per org.
         org_id = await get_org_id_for_contract(pool, contract_id)
         if org_id is None:
             log.warning(
@@ -158,30 +207,15 @@ async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
                 contract_id=contract_id,
             )
 
-        # Generate embeddings in batches.
         texts = [c["content"] for c in clause_dicts]
         vectors = await emb_svc.embed(texts)
-
-        qdrant_points = [
-            {
-                "id": _clause_id_to_qdrant_id(c["id"]),
-                "vector": vectors[i],
-                "payload": {
-                    "clause_id": c["id"],
-                    "contract_id": contract_id,
-                    "label": c.get("label"),
-                    "content": c["content"][:500],  # truncated for RAG snippet display
-                    "org_id": org_id,
-                    "created_at": now_ts.isoformat(),
-                    "created_at_ts": now_ts.timestamp(),
-                },
-            }
-            for i, c in enumerate(clause_dicts)
-        ]
+        qdrant_points = _build_qdrant_points(
+            clause_dicts, vectors, contract_id, org_id, now_ts
+        )
 
         await rag_svc.upsert_clauses(qdrant_points)
 
-        # Step 5 → completed
+        # Step 4 → completed
         await update_ingestion_job(
             pool, job_id, status="completed", progress=100, current_step="완료"
         )
@@ -190,16 +224,6 @@ async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
 
     finally:
         tmp_path.unlink(missing_ok=True)
-
-
-def _clause_id_to_qdrant_id(clause_id: str) -> str:
-    """Convert a 26-char alphanumeric ID to a UUID string for Qdrant.
-
-    Qdrant requires point IDs to be unsigned integers or UUID strings.
-    We pad/hash to produce a deterministic UUID.
-    """
-    # Use uuid5 with a fixed namespace for deterministic mapping.
-    return str(uuid.uuid5(uuid.NAMESPACE_OID, clause_id))
 
 
 def make_handler(
