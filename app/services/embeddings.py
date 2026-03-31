@@ -1,4 +1,5 @@
 """Embedding service: generates vector embeddings using OpenAI text-embedding-3-small."""
+
 from __future__ import annotations
 
 from typing import Sequence
@@ -37,8 +38,7 @@ async def embed(texts: Sequence[str]) -> list[list[float]]:
 
     text_list = list(texts)
     batches = [
-        text_list[i : i + _BATCH_SIZE]
-        for i in range(0, len(text_list), _BATCH_SIZE)
+        text_list[i : i + _BATCH_SIZE] for i in range(0, len(text_list), _BATCH_SIZE)
     ]
 
     for batch_idx, batch in enumerate(batches):
@@ -52,7 +52,9 @@ async def embed(texts: Sequence[str]) -> list[list[float]]:
             model=EMBEDDING_MODEL,
             input=batch,
         )
-        vectors = [item.embedding for item in sorted(response.data, key=lambda x: x.index)]
+        vectors = [
+            item.embedding for item in sorted(response.data, key=lambda x: x.index)
+        ]
         all_vectors.extend(vectors)
 
     return all_vectors

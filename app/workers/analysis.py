@@ -59,10 +59,14 @@ async def _analyze_single_clause(
 ) -> None:
     """Run LLM + RAG for one clause and persist results."""
     async with semaphore:
-        clause_id = clause["id"]
-        clause_text = clause["content"]
-        label = clause.get("label")
-        page_start = clause.get("page_start", 1)
+        clause_id: str = clause["id"]
+        clause_text: str = clause["content"]
+        label: str | None = clause.get("label")
+        page_start: int = clause.get("page_start", 1)
+        anchor_x: float | None = clause.get("anchor_x")
+        anchor_y: float | None = clause.get("anchor_y")
+        anchor_width: float | None = clause.get("anchor_width")
+        anchor_height: float | None = clause.get("anchor_height")
 
         log.info("analyzing clause", clause_id=clause_id, label=label)
 
@@ -121,10 +125,10 @@ async def _analyze_single_clause(
                     llm_result.issue_types[0] if llm_result.issue_types else None
                 ),
                 "summary": llm_result.summary,
-                "highlight_x": clause.get("anchor_x"),
-                "highlight_y": clause.get("anchor_y"),
-                "highlight_width": clause.get("anchor_width"),
-                "highlight_height": clause.get("anchor_height"),
+                "highlight_x": anchor_x,
+                "highlight_y": anchor_y,
+                "highlight_width": anchor_width,
+                "highlight_height": anchor_height,
                 "page_number": page_start,
             },
         )

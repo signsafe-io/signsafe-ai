@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any
 
@@ -48,7 +49,6 @@ async def update_ingestion_job(
                 error_message = $4, updated_at = $5, started_at = $5
             WHERE id = $6
         """
-        params = [status, progress, current_step, error_message, now, job_id]
     elif status in ("completed", "failed"):
         query = """
             UPDATE ingestion_jobs
@@ -56,7 +56,6 @@ async def update_ingestion_job(
                 error_message = $4, updated_at = $5, completed_at = $5
             WHERE id = $6
         """
-        params = [status, progress, current_step, error_message, now, job_id]
     else:
         query = """
             UPDATE ingestion_jobs
@@ -64,7 +63,6 @@ async def update_ingestion_job(
                 error_message = $4, updated_at = $5
             WHERE id = $6
         """
-        params = [status, progress, current_step, error_message, now, job_id]
 
     async with pool.acquire() as conn:
         await conn.execute(query, *params)
@@ -194,7 +192,7 @@ async def update_risk_analysis(
 async def insert_clauses_batch(
     pool: asyncpg.Pool,
     contract_id: str,
-    clauses: list[dict],
+    clauses: list[dict[str, Any]],
 ) -> list[str]:
     """Batch-insert clauses and return their IDs.
 
@@ -329,8 +327,6 @@ async def insert_evidence_set(
         id, clause_result_id, rationale, citations (list),
         recommended_actions (list), top_k, filter_params (dict)
     """
-    import json
-
     now = datetime.now(timezone.utc)
     async with pool.acquire() as conn:
         await conn.execute(
