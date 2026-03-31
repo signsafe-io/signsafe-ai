@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import os
 import pathlib
 import tempfile
 import uuid
@@ -68,8 +67,8 @@ def _download_file(file_path: str, dest: pathlib.Path) -> None:
 
 def _guess_suffix(file_path: str) -> str:
     """Return the file suffix from the S3 key."""
-    _, ext = os.path.splitext(file_path)
-    return ext.lower() if ext else ".pdf"
+    ext = pathlib.Path(file_path).suffix.lower()
+    return ext if ext else ".pdf"
 
 
 def _clause_id_to_qdrant_id(clause_id: str) -> str:

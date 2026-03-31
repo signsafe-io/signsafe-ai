@@ -192,7 +192,7 @@ async def update_risk_analysis(
 async def insert_clauses_batch(
     pool: asyncpg.Pool,
     contract_id: str,
-    clauses: list[dict],
+    clauses: list[dict[str, Any]],
 ) -> list[str]:
     """Batch-insert clauses and return their IDs.
 
