@@ -281,8 +281,8 @@ async def insert_clause_result(
     """Insert a clause_result row and return its id.
 
     result dict fields:
-        id, analysis_id, clause_id, risk_level, issue_type,
-        summary, highlight_x, highlight_y, highlight_width,
+        id, analysis_id, clause_id, risk_level, confidence (float, default 0.5),
+        issue_type, summary, highlight_x, highlight_y, highlight_width,
         highlight_height, page_number
     """
     now = datetime.now(timezone.utc)
@@ -290,21 +290,22 @@ async def insert_clause_result(
         await conn.execute(
             """
             INSERT INTO clause_results (
-                id, analysis_id, clause_id, risk_level, issue_type,
+                id, analysis_id, clause_id, risk_level, confidence, issue_type,
                 summary, highlight_x, highlight_y,
                 highlight_width, highlight_height, page_number,
                 created_at, updated_at
             ) VALUES (
                 $1, $2, $3, $4, $5,
-                $6, $7, $8,
-                $9, $10, $11,
-                $12, $12
+                $6, $7, $8, $9,
+                $10, $11, $12,
+                $13, $13
             )
             """,
             result["id"],
             result["analysis_id"],
             result["clause_id"],
             result["risk_level"],
+            float(result.get("confidence", 0.5)),
             result.get("issue_type"),
             result.get("summary"),
             result.get("highlight_x"),

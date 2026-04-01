@@ -10,9 +10,9 @@ Processing pipeline:
     1. Receive message → Analysis status running
     2. Load clauses from DB
     3. Parallel analysis (max 5 concurrent):
-       a. LLM analysis → risk_level, issue_types, summary, rationale
+       a. LLM analysis → risk_level, confidence, issue_types, summary, rationale
        b. RAG search → topK=3 similar clauses
-       c. Save clause_result to DB
+       c. Save clause_result to DB (including confidence)
        d. Save evidence_set to DB
     4. Analysis status completed
     5. On failure → status failed
@@ -148,7 +148,7 @@ async def _analyze_single_clause(
             for s in similar
         ]
 
-        # Persist clause_result.
+        # Persist clause_result (includes confidence score from LLM).
         clause_result_id = _new_id()
         await insert_clause_result(
             pool,
@@ -157,6 +157,7 @@ async def _analyze_single_clause(
                 "analysis_id": analysis_id,
                 "clause_id": clause_id,
                 "risk_level": llm_result.risk_level,
+                "confidence": llm_result.confidence,
                 "issue_type": (
                     llm_result.issue_types[0] if llm_result.issue_types else None
                 ),
@@ -189,6 +190,7 @@ async def _analyze_single_clause(
             "clause analysis saved",
             clause_id=clause_id,
             risk_level=llm_result.risk_level,
+            confidence=llm_result.confidence,
         )
 
 

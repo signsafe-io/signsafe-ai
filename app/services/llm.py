@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import structlog
@@ -50,10 +50,16 @@ _ANALYSIS_PROMPT_TEMPLATE = """계약서 조항을 분석하여 리스크를 평
 다음 JSON 형식으로만 응답하세요:
 {{
   "risk_level": "HIGH|MEDIUM|LOW",
+  "confidence": 0.85,
   "issue_types": ["LIABILITY_LIMITATION", ...],
   "summary": "한국어 리스크 요약 (2-3문장)",
   "rationale": "판단 근거 상세 설명"
 }}
+
+confidence 필드 설명:
+- 0.0~1.0 사이의 숫자로, 위험도 판단에 대한 신뢰도를 나타냅니다.
+- 1.0에 가까울수록 명확하고 확실한 판단, 0.5에 가까울수록 해석이 불분명합니다.
+- 예시: 명확한 고위험 조항 → 0.95, 해석 여지가 있는 조항 → 0.65
 
 이슈 유형 목록:
 - LIABILITY_LIMITATION: 손해배상 제한
@@ -72,10 +78,11 @@ class ClauseAnalysisResult:
     """Result of LLM clause risk analysis."""
 
     risk_level: str  # HIGH | MEDIUM | LOW
+    confidence: float  # 0.0 ~ 1.0
     issue_types: list[str]
     summary: str
     rationale: str
-    raw: dict[str, Any]
+    raw: dict[str, Any] = field(default_factory=dict)
 
 
 def _extract_json(text: str) -> dict[str, Any]:
@@ -96,6 +103,15 @@ def _normalize_risk_level(value: str) -> str:
     # Fallback mapping for unexpected values.
     mapping = {"높음": "HIGH", "중간": "MEDIUM", "낮음": "LOW"}
     return mapping.get(value.strip(), "MEDIUM")
+
+
+def _normalize_confidence(value: Any) -> float:
+    """Clamp confidence to [0.0, 1.0]. Returns 0.5 on invalid input."""
+    try:
+        f = float(value)
+        return max(0.0, min(1.0, f))
+    except (TypeError, ValueError):
+        return 0.5
 
 
 @retry(
@@ -148,6 +164,7 @@ async def analyze_clause(clause_text: str) -> ClauseAnalysisResult:
         # Return safe defaults on parse failure.
         return ClauseAnalysisResult(
             risk_level="MEDIUM",
+            confidence=0.5,
             issue_types=[],
             summary="분석 결과를 파싱하지 못했습니다.",
             rationale=raw_text,
@@ -156,6 +173,7 @@ async def analyze_clause(clause_text: str) -> ClauseAnalysisResult:
 
     return ClauseAnalysisResult(
         risk_level=_normalize_risk_level(data.get("risk_level", "MEDIUM")),
+        confidence=_normalize_confidence(data.get("confidence", 0.5)),
         issue_types=data.get("issue_types", []),
         summary=data.get("summary", ""),
         rationale=data.get("rationale", ""),
