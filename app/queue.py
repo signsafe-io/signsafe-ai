@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -10,6 +11,7 @@ import aio_pika
 import structlog
 
 from app.config import settings
+from app.errors import PermanentError, RetryableError
 
 log = structlog.get_logger()
 
@@ -19,6 +21,11 @@ ANALYSIS_QUEUE = "analysis.jobs"
 
 INGESTION_DLQ = f"{INGESTION_QUEUE}.dlq"
 ANALYSIS_DLQ = f"{ANALYSIS_QUEUE}.dlq"
+
+# Retry configuration for RetryableError
+_MAX_RETRIES = 3
+_RETRY_BASE_DELAY = 2.0  # seconds
+_RETRY_MAX_DELAY = 30.0  # seconds
 
 
 async def connect_queue() -> aio_pika.abc.AbstractRobustConnection:
@@ -90,8 +97,13 @@ async def consume(
 ) -> None:
     """Consume messages from queue_name, calling handler for each message.
 
-    On handler success the message is acked.
-    On any exception the message is nacked (requeue=False) so it goes to DLQ.
+    Error handling strategy:
+    - PermanentError: ack the message (no retry, no DLQ). The handler is
+      responsible for recording failure in the DB before raising.
+    - RetryableError: retry up to _MAX_RETRIES times with exponential back-off.
+      If all retries are exhausted, nack → DLQ.
+    - Any other Exception: treated as RetryableError (unknown errors may be
+      transient) — same retry/DLQ path.
     """
     channel = await connection.channel()
     await channel.set_qos(prefetch_count=1)
@@ -101,10 +113,64 @@ async def consume(
 
     async with queue.iterator() as messages:
         async for message in messages:
-            async with message.process(requeue=False):
+            # Use manual ack/nack so we can control DLQ routing precisely.
+            try:
+                body = json.loads(message.body)
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                log.error(
+                    "unparseable message — acking to prevent DLQ loop",
+                    queue=queue_name,
+                    error=str(exc),
+                )
+                await message.ack()
+                continue
+
+            last_exc: BaseException | None = None
+            for attempt in range(1, _MAX_RETRIES + 1):
                 try:
-                    body = json.loads(message.body)
                     await handler(body)
-                except Exception:
-                    log.exception("message processing failed", queue=queue_name)
-                    raise  # aio-pika nacks and routes to DLQ
+                    last_exc = None
+                    break  # success
+                except PermanentError as exc:
+                    log.error(
+                        "permanent error — acking message without DLQ",
+                        queue=queue_name,
+                        attempt=attempt,
+                        error=str(exc),
+                    )
+                    last_exc = exc
+                    break  # do not retry permanent errors
+                except (RetryableError, Exception) as exc:
+                    last_exc = exc
+                    if attempt < _MAX_RETRIES:
+                        delay = min(
+                            _RETRY_BASE_DELAY * (2 ** (attempt - 1)),
+                            _RETRY_MAX_DELAY,
+                        )
+                        log.warning(
+                            "retryable error — will retry",
+                            queue=queue_name,
+                            attempt=attempt,
+                            max_retries=_MAX_RETRIES,
+                            delay=delay,
+                            error=str(exc),
+                        )
+                        await asyncio.sleep(delay)
+                    else:
+                        log.error(
+                            "all retries exhausted — routing to DLQ",
+                            queue=queue_name,
+                            max_retries=_MAX_RETRIES,
+                            error=str(exc),
+                        )
+
+            if last_exc is None:
+                # Success
+                await message.ack()
+            elif isinstance(last_exc, PermanentError):
+                # Permanent failure: ack so it does NOT go to DLQ.
+                # The handler has already written the failure to the DB.
+                await message.ack()
+            else:
+                # Retryable failure exhausted all attempts: nack → DLQ.
+                await message.nack(requeue=False)
