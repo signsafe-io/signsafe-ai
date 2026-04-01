@@ -16,6 +16,12 @@ Processing pipeline:
        d. Save evidence_set to DB
     4. Analysis status completed
     5. On failure → status failed
+
+Error classification:
+    PermanentError — missing required fields, DB schema issues. Message is
+        acked immediately; no DLQ routing.
+    RetryableError — DB connection loss, LLM 429/503, timeout. Consumer retries
+        up to _MAX_RETRIES times with exponential back-off before routing to DLQ.
 """
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ from typing import Any
 
 import asyncpg
 import structlog
+from anthropic import APIStatusError
 
 from app.db import (
     get_clauses_for_contract,
@@ -35,6 +42,7 @@ from app.db import (
     insert_evidence_set,
     update_risk_analysis,
 )
+from app.errors import PermanentError, RetryableError
 from app.services import rag as rag_svc
 from app.services.llm import MODEL, analyze_clause
 
@@ -48,6 +56,36 @@ _CLAUSE_TIMEOUT = 120.0
 def _new_id() -> str:
     """Generate a 26-char alphanumeric ID (similar to ULID format)."""
     return str(uuid.uuid4()).replace("-", "")[:26]
+
+
+def _classify_exception(exc: BaseException) -> type[RetryableError | PermanentError]:
+    """Map an arbitrary exception to a retryable vs permanent category.
+
+    Rules:
+    - Anthropic 429 (rate limit) / 503 (overloaded) → retryable
+    - asyncpg connection errors → retryable
+    - TimeoutError / asyncio.TimeoutError → retryable (may recover)
+    - All other Anthropic API errors → permanent (bad request, auth)
+    - KeyError / TypeError / ValueError (malformed data) → permanent
+    """
+    if isinstance(exc, APIStatusError):
+        if exc.status_code in (429, 503):
+            return RetryableError
+        return PermanentError
+
+    if isinstance(
+        exc, (asyncpg.PostgresConnectionError, asyncpg.TooManyConnectionsError)
+    ):
+        return RetryableError
+
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+        return RetryableError
+
+    if isinstance(exc, (KeyError, TypeError, ValueError)):
+        return PermanentError
+
+    # Default: treat as retryable (unknown errors may be transient)
+    return RetryableError
 
 
 async def _analyze_single_clause(
@@ -97,8 +135,6 @@ async def _analyze_single_clause(
         )
 
         # Build citations from similar clauses.
-        # Field names must match the frontend Citation TypeScript interface:
-        # id, type, title, snippet, whyRelevant, source?, score?
         citations = [
             {
                 "id": s.get("clause_id") or "",
@@ -173,20 +209,31 @@ def _build_recommended_actions(issue_types: list[str]) -> list[str]:
 
 
 async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
-    contract_id: str = msg["contractId"]
-    analysis_id: str = msg["analysisId"]
+    # Validate required fields — raise PermanentError if missing
+    try:
+        contract_id: str = msg["contractId"]
+        analysis_id: str = msg["analysisId"]
+    except KeyError as exc:
+        raise PermanentError(f"Missing required message field: {exc}") from exc
 
     log.info("analysis started", analysis_id=analysis_id, contract_id=contract_id)
 
     # Step 1 — mark running.
-    await update_risk_analysis(pool, analysis_id, status="running")
+    try:
+        await update_risk_analysis(pool, analysis_id, status="running")
+    except asyncpg.PostgresConnectionError as exc:
+        raise RetryableError(f"DB connection error on status update: {exc}") from exc
 
     # Ensure Qdrant collection exists before running RAG searches.
     # This handles the case where Qdrant restarts and the collection is gone.
     await rag_svc.ensure_collection()
 
     # Step 2 — load clauses.
-    clauses = await get_clauses_for_contract(pool, contract_id)
+    try:
+        clauses = await get_clauses_for_contract(pool, contract_id)
+    except asyncpg.PostgresConnectionError as exc:
+        raise RetryableError(f"DB connection error loading clauses: {exc}") from exc
+
     if not clauses:
         log.warning("no clauses found for contract", contract_id=contract_id)
         await update_risk_analysis(
@@ -216,27 +263,40 @@ async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Log per-clause failures but do not propagate; partial results are acceptable.
-    failed_count = 0
+    # Categorise per-clause failures.
+    failed_retryable = 0
+    failed_permanent = 0
     for clause, result in zip(clauses, results):
         if isinstance(result, BaseException):
-            failed_count += 1
+            category = _classify_exception(result)
+            if category is RetryableError:
+                failed_retryable += 1
+            else:
+                failed_permanent += 1
             log.error(
                 "clause analysis failed",
                 clause_id=clause["id"],
                 analysis_id=analysis_id,
+                error_type=category.__name__,
                 error=str(result),
             )
 
+    failed_count = failed_retryable + failed_permanent
     if failed_count:
         log.warning(
             "analysis completed with clause failures",
             analysis_id=analysis_id,
-            failed=failed_count,
+            failed_retryable=failed_retryable,
+            failed_permanent=failed_permanent,
             total=len(clauses),
         )
 
-    # Step 4 — mark completed.
+    # If ALL clauses failed with retryable errors (none permanent), propagate
+    # as RetryableError so the consumer can retry the entire analysis job.
+    if failed_retryable == len(clauses) and failed_permanent == 0:
+        raise RetryableError(f"All {len(clauses)} clauses failed with retryable errors")
+
+    # Step 4 — mark completed (partial success is still completed).
     await update_risk_analysis(
         pool,
         analysis_id,
@@ -257,14 +317,11 @@ def make_handler(
 
     RETRIEVE_EVIDENCE messages are acknowledged and ignored here because the
     actual retrieval logic (re-running RAG) is not yet implemented as a background
-    step — evidence is already populated during the initial analysis pass. Silently
-    dropping the message prevents the queue from being poisoned with unhandled types.
+    step — evidence is already populated during the initial analysis pass.
     """
 
     async def handler(msg: dict[str, Any]) -> None:
-        # Route by message type. RETRIEVE_EVIDENCE messages are sent to this
-        # queue by evidenceSvc.RetrieveEvidence and must not be processed as
-        # analysis jobs (they lack contractId/analysisId fields).
+        # Route by message type.
         msg_type = msg.get("type")
         if msg_type == "RETRIEVE_EVIDENCE":
             log.info(
@@ -277,9 +334,9 @@ def make_handler(
         contract_id = msg.get("contractId", "unknown")
         try:
             await _process(pool, msg)
-        except Exception as exc:
-            log.exception(
-                "analysis failed",
+        except PermanentError as exc:
+            log.error(
+                "permanent analysis failure — marking failed, acking message (no DLQ)",
                 analysis_id=analysis_id,
                 contract_id=contract_id,
                 error=str(exc),
@@ -296,6 +353,26 @@ def make_handler(
                     "failed to update analysis status to failed",
                     analysis_id=analysis_id,
                 )
-            raise  # re-raise so aio-pika nacks → DLQ
+            raise  # re-raise PermanentError; queue.consume acks without DLQ
+        except (RetryableError, Exception) as exc:
+            log.error(
+                "retryable analysis failure — will retry or route to DLQ",
+                analysis_id=analysis_id,
+                contract_id=contract_id,
+                error=str(exc),
+            )
+            try:
+                await update_risk_analysis(
+                    pool,
+                    analysis_id,
+                    status="failed",
+                    error_message=str(exc),
+                )
+            except Exception:
+                log.exception(
+                    "failed to update analysis status to failed",
+                    analysis_id=analysis_id,
+                )
+            raise  # re-raise; queue.consume retries or nacks → DLQ
 
     return handler

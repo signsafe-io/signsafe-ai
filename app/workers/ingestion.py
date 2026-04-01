@@ -18,6 +18,12 @@ Processing pipeline:
     8. Generate embeddings → upsert to Qdrant
     9. Job status → completed, progress 100%
    10. On failure → job status failed, store error message
+
+Error classification:
+    PermanentError — missing required fields, unsupported file type, PDF parse
+        errors. Message is acked; no DLQ routing.
+    RetryableError — S3 download failures, DB connection errors, Qdrant
+        unavailability. Consumer retries with exponential back-off.
 """
 
 from __future__ import annotations
@@ -34,6 +40,7 @@ from typing import Any
 import asyncpg
 import boto3
 import structlog
+from botocore.exceptions import BotoCoreError, ClientError
 
 from app.config import settings
 from app.db import (
@@ -42,6 +49,7 @@ from app.db import (
     update_contract_status,
     update_ingestion_job,
 )
+from app.errors import PermanentError, RetryableError
 from app.services import embeddings as emb_svc
 from app.services import parser as parser_svc
 from app.services import rag as rag_svc
@@ -86,16 +94,32 @@ async def _download_and_parse(
     tmp_path: pathlib.Path,
 ) -> list[Any]:
     """Download file from S3 and parse it into raw clauses."""
-    await loop.run_in_executor(
-        None, functools.partial(_download_file, file_path, tmp_path)
-    )
+    try:
+        await loop.run_in_executor(
+            None, functools.partial(_download_file, file_path, tmp_path)
+        )
+    except ClientError as exc:
+        error_code = exc.response.get("Error", {}).get("Code", "")
+        if error_code in ("NoSuchKey", "404", "AccessDenied", "403"):
+            raise PermanentError(
+                f"S3 object not accessible: {file_path} ({error_code})"
+            ) from exc
+        raise RetryableError(f"S3 download failed (retryable): {exc}") from exc
+    except BotoCoreError as exc:
+        raise RetryableError(f"S3 connection error: {exc}") from exc
+
     log.info("file downloaded", path=str(tmp_path), size=tmp_path.stat().st_size)
 
     # CPU-bound + sync C library; offload to thread pool to avoid blocking
     # the event loop shared with the analysis worker.
-    clauses = await loop.run_in_executor(
-        None, functools.partial(parser_svc.parse_sync, tmp_path)
-    )
+    try:
+        clauses = await loop.run_in_executor(
+            None, functools.partial(parser_svc.parse_sync, tmp_path)
+        )
+    except Exception as exc:
+        # Parser errors are permanent — the file content won't change on retry.
+        raise PermanentError(f"Document parse error: {exc}") from exc
+
     log.info("parsing complete", clause_count=len(clauses))
     return clauses
 
@@ -154,16 +178,23 @@ def _build_qdrant_points(
 
 
 async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
-    contract_id: str = msg["contractId"]
-    job_id: str = msg["jobId"]
-    file_path: str = msg["filePath"]
+    # Validate required fields — raise PermanentError if missing
+    try:
+        contract_id: str = msg["contractId"]
+        job_id: str = msg["jobId"]
+        file_path: str = msg["filePath"]
+    except KeyError as exc:
+        raise PermanentError(f"Missing required message field: {exc}") from exc
 
     log.info("ingestion started", job_id=job_id, contract_id=contract_id)
 
     # Step 1 → parsing
-    await update_ingestion_job(
-        pool, job_id, status="parsing", progress=0, current_step="파일 다운로드 중"
-    )
+    try:
+        await update_ingestion_job(
+            pool, job_id, status="parsing", progress=0, current_step="파일 다운로드 중"
+        )
+    except asyncpg.PostgresConnectionError as exc:
+        raise RetryableError(f"DB connection error: {exc}") from exc
 
     suffix = _guess_suffix(file_path)
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
@@ -185,7 +216,13 @@ async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
         now_ts = datetime.now(timezone.utc)
         clause_dicts = _build_clause_dicts(clauses, now_ts)
 
-        await insert_clauses_batch(pool, contract_id, clause_dicts)
+        try:
+            await insert_clauses_batch(pool, contract_id, clause_dicts)
+        except asyncpg.PostgresConnectionError as exc:
+            raise RetryableError(
+                f"DB connection error inserting clauses: {exc}"
+            ) from exc
+
         log.info("clauses saved to DB", count=len(clause_dicts))
 
         # Step 3 → indexing
@@ -199,7 +236,11 @@ async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
 
         await rag_svc.ensure_collection()
 
-        org_id = await get_org_id_for_contract(pool, contract_id)
+        try:
+            org_id = await get_org_id_for_contract(pool, contract_id)
+        except asyncpg.PostgresConnectionError as exc:
+            raise RetryableError(f"DB connection error fetching org_id: {exc}") from exc
+
         if org_id is None:
             log.warning(
                 "org_id not found for contract — Qdrant points will have null org_id",
@@ -235,9 +276,9 @@ def make_handler(
         contract_id = msg.get("contractId", "unknown")
         try:
             await _process(pool, msg)
-        except Exception as exc:
-            log.exception(
-                "ingestion failed",
+        except PermanentError as exc:
+            log.error(
+                "permanent ingestion failure — marking failed, acking message (no DLQ)",
                 job_id=job_id,
                 contract_id=contract_id,
                 error=str(exc),
@@ -253,6 +294,25 @@ def make_handler(
                 await update_contract_status(pool, contract_id, "failed")
             except Exception:
                 log.exception("failed to update job status to failed", job_id=job_id)
-            raise  # re-raise so aio-pika nacks → DLQ
+            raise  # re-raise PermanentError; queue.consume acks without DLQ
+        except (RetryableError, Exception) as exc:
+            log.error(
+                "retryable ingestion failure — will retry or route to DLQ",
+                job_id=job_id,
+                contract_id=contract_id,
+                error=str(exc),
+            )
+            try:
+                await update_ingestion_job(
+                    pool,
+                    job_id,
+                    status="failed",
+                    progress=0,
+                    error_message=str(exc),
+                )
+                await update_contract_status(pool, contract_id, "failed")
+            except Exception:
+                log.exception("failed to update job status to failed", job_id=job_id)
+            raise  # re-raise; queue.consume retries or nacks → DLQ
 
     return handler
