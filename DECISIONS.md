@@ -130,3 +130,23 @@
 **DLQ 큐 이름**:
 - `ingestion.jobs.dlq`
 - `analysis.jobs.dlq`
+
+---
+
+## ADR-007: LLM 응답 confidence score 추가
+
+**날짜**: 2026-04-01
+
+**결정**: LLM 프롬프트에 `confidence: 0.0~1.0` 필드를 요청하고, `ClauseAnalysisResult`에 포함하여 DB에 저장한다.
+
+**이유**:
+- risk_level만으로는 판단의 확실성을 알 수 없음
+- UI에서 "낮은 신뢰도" 조항을 다르게 표시하거나 사용자 검토 유도 가능
+- 프롬프트 수정만으로 추가 가능하며 LLM 호출 횟수 증가 없음
+
+**설계**:
+- 파싱 실패 또는 범위 초과 시 `_normalize_confidence()`가 0.5로 클램핑
+- DB 컬럼: `clause_results.confidence FLOAT NOT NULL DEFAULT 0.5` (migration 000006)
+- 이전에 저장된 행은 DEFAULT 0.5로 초기화됨
+
+**영향**: signsafe-api 마이그레이션 필요 (000006 추가, 완료)
