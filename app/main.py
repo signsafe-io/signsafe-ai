@@ -57,8 +57,13 @@ async def main() -> None:
         log.info("shutdown signal received, stopping workers", signal=sig)
         shutdown_event.set()
 
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, _request_shutdown, sig)
+    try:
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, _request_shutdown, sig)
+    except NotImplementedError:
+        # Windows does not support add_signal_handler; fall back to signal.signal.
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, lambda s, _: _request_shutdown(s))
 
     # Run main consumers and DLQ monitors until a shutdown signal is received.
     # asyncio.gather is cancelled when shutdown_event fires so that
