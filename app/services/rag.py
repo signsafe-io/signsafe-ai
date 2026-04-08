@@ -23,6 +23,7 @@ from app.services.embeddings import EMBEDDING_DIM, embed
 log = structlog.get_logger()
 
 COLLECTION_NAME = "clauses"
+CASES_COLLECTION_NAME = "cases"
 
 _client: AsyncQdrantClient | None = None
 
@@ -34,23 +35,28 @@ def _get_client() -> AsyncQdrantClient:
     return _client
 
 
-async def ensure_collection() -> None:
-    """Create the clauses collection if it does not already exist."""
+async def _ensure_collection(name: str) -> None:
     client = _get_client()
     collections = await client.get_collections()
     existing = {c.name for c in collections.collections}
-
-    if COLLECTION_NAME not in existing:
+    if name not in existing:
         await client.create_collection(
-            collection_name=COLLECTION_NAME,
-            vectors_config=VectorParams(
-                size=EMBEDDING_DIM,
-                distance=Distance.COSINE,
-            ),
+            collection_name=name,
+            vectors_config=VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE),
         )
-        log.info("qdrant collection created", collection=COLLECTION_NAME)
+        log.info("qdrant collection created", collection=name)
     else:
-        log.info("qdrant collection exists", collection=COLLECTION_NAME)
+        log.info("qdrant collection exists", collection=name)
+
+
+async def ensure_collection() -> None:
+    """Create the clauses collection if it does not already exist."""
+    await _ensure_collection(COLLECTION_NAME)
+
+
+async def ensure_cases_collection() -> None:
+    """Create the cases collection if it does not already exist."""
+    await _ensure_collection(CASES_COLLECTION_NAME)
 
 
 async def upsert_clauses(
@@ -139,6 +145,56 @@ async def search_similar_clauses(
             "label": r.payload.get("label"),
             "score": r.score,
             "payload": r.payload,
+        }
+        for r in results
+    ]
+
+
+async def search_legal_references(
+    query_text: str,
+    top_k: int = 3,
+    ref_type: str | None = None,
+) -> list[dict[str, Any]]:
+    """Search Qdrant cases collection for relevant 판례/법령.
+
+    Args:
+        query_text: clause text to search against.
+        top_k: number of results to return.
+        ref_type: optional filter — "prec" for 판례, "law" for 법령, None for both.
+    """
+    client = _get_client()
+
+    # Silently skip if the collection doesn't exist yet.
+    collections = await client.get_collections()
+    existing = {c.name for c in collections.collections}
+    if CASES_COLLECTION_NAME not in existing:
+        return []
+
+    vectors = await embed([query_text])
+    query_vector = vectors[0]
+
+    must: list[Any] = []
+    if ref_type:
+        must.append(FieldCondition(key="type", match=MatchValue(value=ref_type)))
+    query_filter = Filter(must=must) if must else None
+
+    results = await client.search(
+        collection_name=CASES_COLLECTION_NAME,
+        query_vector=query_vector,
+        limit=top_k,
+        query_filter=query_filter,
+        with_payload=True,
+    )
+
+    return [
+        {
+            "type": r.payload.get("type", "prec"),
+            "source_id": r.payload.get("source_id", ""),
+            "title": r.payload.get("title", ""),
+            "content": r.payload.get("content", ""),
+            "date": r.payload.get("date", ""),
+            "court": r.payload.get("court", ""),
+            "score": r.score,
         }
         for r in results
     ]

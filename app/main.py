@@ -1,6 +1,7 @@
 import asyncio
 import signal
 import sys
+from datetime import datetime, timedelta, timezone
 
 import structlog
 
@@ -17,6 +18,39 @@ from app.queue import (
 )
 
 log = structlog.get_logger()
+
+_KST = timezone(timedelta(hours=9))
+
+
+def _seconds_until_next_monday_4am() -> float:
+    """Return seconds until next Monday 04:00 KST."""
+    now = datetime.now(_KST)
+    days_ahead = -now.weekday()  # Monday = 0
+    if days_ahead < 0 or (days_ahead == 0 and now.hour >= 4):
+        days_ahead += 7
+    next_run = (now + timedelta(days=days_ahead)).replace(
+        hour=4, minute=0, second=0, microsecond=0
+    )
+    return (next_run - now).total_seconds()
+
+
+async def _run_weekly_legal_update() -> None:
+    """Background task: update legal vector DB every Monday 04:00 KST."""
+    from app.services.legal_updater import run_update
+
+    while True:
+        wait = _seconds_until_next_monday_4am()
+        next_run = datetime.now(_KST) + timedelta(seconds=wait)
+        log.info(
+            "legal update scheduled",
+            next_run=next_run.strftime("%Y-%m-%d %H:%M KST"),
+            wait_hours=round(wait / 3600, 1),
+        )
+        await asyncio.sleep(wait)
+        try:
+            await run_update()
+        except Exception:
+            log.exception("weekly legal update failed — will retry next Monday")
 
 
 def _validate_config() -> None:
@@ -75,6 +109,7 @@ async def main() -> None:
             consume(queue_conn, ANALYSIS_QUEUE, analysis_handler),
             consume_dlq(queue_conn, INGESTION_DLQ),
             consume_dlq(queue_conn, ANALYSIS_DLQ),
+            _run_weekly_legal_update(),
         )
     )
 

@@ -37,14 +37,17 @@ from anthropic import APIStatusError
 
 from app.db import (
     get_clauses_for_contract,
+    get_evidence_set_with_clause,
     get_org_id_for_analysis,
     insert_clause_result,
     insert_evidence_set,
+    update_evidence_set_citations,
     update_risk_analysis,
+    update_risk_analysis_summary,
 )
 from app.errors import PermanentError, RetryableError
 from app.services import rag as rag_svc
-from app.services.llm import MODEL, analyze_clause
+from app.services.llm import MODEL, ClauseAnalysisResult, analyze_clause, summarize_document
 
 log = structlog.get_logger()
 
@@ -94,8 +97,8 @@ async def _analyze_single_clause(
     clause: asyncpg.Record,
     semaphore: asyncio.Semaphore,
     org_id: str | None = None,
-) -> None:
-    """Run LLM + RAG for one clause and persist results."""
+) -> ClauseAnalysisResult:
+    """Run LLM + RAG for one clause, persist results, and return the LLM result."""
     async with semaphore:
         clause_id: str = clause["id"]
         clause_text: str = clause["content"]
@@ -128,24 +131,43 @@ async def _analyze_single_clause(
         # RAG: find similar clauses scoped to the same organization.
         # Passing org_id ensures we only surface evidence from the org's own
         # historical contracts, preventing cross-tenant data leakage.
-        similar = await rag_svc.search_similar_clauses(
-            query_text=clause_text,
-            top_k=3,
-            org_id=org_id,
+        similar, legal_refs = await asyncio.gather(
+            rag_svc.search_similar_clauses(
+                query_text=clause_text,
+                top_k=3,
+                org_id=org_id,
+            ),
+            rag_svc.search_legal_references(
+                query_text=clause_text,
+                top_k=3,
+            ),
         )
 
-        # Build citations from similar clauses.
+        # Build citations: clause-based + legal references (판례/법령).
         citations = [
             {
                 "id": s.get("clause_id") or "",
                 "type": "clause",
-                "title": s.get("label") or "Similar clause",
+                "title": s.get("label") or "유사 조항",
                 "snippet": s.get("payload", {}).get("content", "")[:200],
                 "whyRelevant": "",
                 "source": s.get("contract_id"),
                 "score": s.get("score"),
             }
             for s in similar
+        ] + [
+            {
+                "id": r.get("source_id") or "",
+                "type": r.get("type", "prec"),
+                "title": r.get("title") or ("판례" if r.get("type") == "prec" else "법령"),
+                "snippet": r.get("content", "")[:200],
+                "whyRelevant": "",
+                "source": f"https://www.law.go.kr/판례/{r.get('source_id', '')}",
+                "score": r.get("score"),
+                "date": r.get("date", ""),
+                "court": r.get("court", ""),
+            }
+            for r in legal_refs
         ]
 
         # Persist clause_result (includes confidence score from LLM).
@@ -192,6 +214,7 @@ async def _analyze_single_clause(
             risk_level=llm_result.risk_level,
             confidence=llm_result.confidence,
         )
+        return llm_result
 
 
 def _build_recommended_actions(issue_types: list[str]) -> list[str]:
@@ -208,6 +231,68 @@ def _build_recommended_actions(issue_types: list[str]) -> list[str]:
         "PAYMENT_TERMS": "지급 기한, 연체 이자, 이의제기 절차를 명시적으로 규정하세요.",
     }
     return [actions_map[it] for it in issue_types if it in actions_map]
+
+
+async def _handle_retrieve_evidence(
+    pool: asyncpg.Pool, msg: dict[str, Any]
+) -> None:
+    """Re-run RAG for an evidence set and update its citations.
+
+    Message format:
+        {
+            "type": "RETRIEVE_EVIDENCE",
+            "evidenceSetId": "<ID>",
+            "orgId": "<org UUID>"   (optional)
+        }
+    """
+    evidence_set_id = msg.get("evidenceSetId")
+    if not evidence_set_id:
+        raise PermanentError("RETRIEVE_EVIDENCE message missing evidenceSetId")
+
+    log.info("RETRIEVE_EVIDENCE started", evidence_set_id=evidence_set_id)
+
+    try:
+        row = await get_evidence_set_with_clause(pool, evidence_set_id)
+    except asyncpg.PostgresConnectionError as exc:
+        raise RetryableError(f"DB error fetching evidence set: {exc}") from exc
+
+    if row is None:
+        raise PermanentError(f"evidence_set not found: {evidence_set_id}")
+
+    clause_text: str = row["clause_content"]
+    org_id: str | None = msg.get("orgId") or row["org_id"]
+    top_k: int = row["top_k"] or 3
+
+    similar = await rag_svc.search_similar_clauses(
+        query_text=clause_text,
+        top_k=top_k,
+        org_id=org_id,
+    )
+
+    citations = [
+        {
+            "id": s.get("clause_id") or "",
+            "type": "clause",
+            "title": s.get("label") or "유사 조항",
+            "snippet": s.get("payload", {}).get("content", "")[:200],
+            "whyRelevant": "",
+            "source": s.get("contract_id"),
+            "score": s.get("score"),
+            "url": f"/contracts/{s.get('contract_id')}/clauses/{s.get('clause_id')}",
+        }
+        for s in similar
+    ]
+
+    try:
+        await update_evidence_set_citations(pool, evidence_set_id, citations)
+    except asyncpg.PostgresConnectionError as exc:
+        raise RetryableError(f"DB error updating citations: {exc}") from exc
+
+    log.info(
+        "RETRIEVE_EVIDENCE completed",
+        evidence_set_id=evidence_set_id,
+        citations_count=len(citations),
+    )
 
 
 async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
@@ -298,7 +383,34 @@ async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
     if failed_retryable == len(clauses) and failed_permanent == 0:
         raise RetryableError(f"All {len(clauses)} clauses failed with retryable errors")
 
-    # Step 4 — mark completed (partial success is still completed).
+    # Step 4 — generate document-level summary from successful clause results.
+    successful_results: list[ClauseAnalysisResult] = [
+        r for r in results if isinstance(r, ClauseAnalysisResult)
+    ]
+    if successful_results:
+        try:
+            doc_summary = await summarize_document(successful_results)
+            await update_risk_analysis_summary(
+                pool,
+                analysis_id,
+                document_summary=doc_summary.summary,
+                overall_risk=doc_summary.overall_risk,
+                key_issues=doc_summary.key_issues,
+            )
+            log.info(
+                "document summary saved",
+                analysis_id=analysis_id,
+                overall_risk=doc_summary.overall_risk,
+            )
+        except Exception as exc:
+            # Document summary failure is non-fatal — log and continue.
+            log.error(
+                "document summary failed, skipping",
+                analysis_id=analysis_id,
+                error=str(exc),
+            )
+
+    # Step 5 — mark completed (partial success is still completed).
     await update_risk_analysis(
         pool,
         analysis_id,
@@ -315,21 +427,30 @@ def make_handler(
 
     Handles two message types on analysis.jobs:
       1. Analysis jobs: {"contractId": "...", "analysisId": "..."}
-      2. RETRIEVE_EVIDENCE: {"type": "RETRIEVE_EVIDENCE", "evidenceSetId": "...", ...}
-
-    RETRIEVE_EVIDENCE messages are acknowledged and ignored here because the
-    actual retrieval logic (re-running RAG) is not yet implemented as a background
-    step — evidence is already populated during the initial analysis pass.
+      2. RETRIEVE_EVIDENCE: {"type": "RETRIEVE_EVIDENCE", "evidenceSetId": "...", "orgId": "..."}
     """
 
     async def handler(msg: dict[str, Any]) -> None:
         # Route by message type.
         msg_type = msg.get("type")
         if msg_type == "RETRIEVE_EVIDENCE":
-            log.info(
-                "RETRIEVE_EVIDENCE message received and acknowledged (no-op)",
-                evidence_set_id=msg.get("evidenceSetId"),
-            )
+            evidence_set_id = msg.get("evidenceSetId", "unknown")
+            try:
+                await _handle_retrieve_evidence(pool, msg)
+            except PermanentError as exc:
+                log.error(
+                    "permanent RETRIEVE_EVIDENCE failure",
+                    evidence_set_id=evidence_set_id,
+                    error=str(exc),
+                )
+                raise
+            except (RetryableError, Exception) as exc:
+                log.error(
+                    "retryable RETRIEVE_EVIDENCE failure",
+                    evidence_set_id=evidence_set_id,
+                    error=str(exc),
+                )
+                raise
             return
 
         analysis_id = msg.get("analysisId", "unknown")

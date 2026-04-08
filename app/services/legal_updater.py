@@ -1,0 +1,169 @@
+"""Legal data updater: crawls 판례 and 법령 from law.go.kr and upserts into Qdrant."""
+
+from __future__ import annotations
+
+import uuid
+from typing import Any
+
+import httpx
+import structlog
+from bs4 import BeautifulSoup
+from qdrant_client.http.models import PointStruct
+
+from app.config import settings
+from app.services.embeddings import embed
+from app.services.rag import CASES_COLLECTION_NAME, _get_client, ensure_cases_collection
+
+log = structlog.get_logger()
+
+_API_BASE = "https://www.law.go.kr/DRF"
+_QUERIES = ["불공정계약", "손해배상", "계약해지", "약관", "위약금", "기밀유지", "지식재산권"]
+_DISPLAY = 10
+
+
+def _to_uuid(source_id: str, ref_type: str) -> str:
+    """Deterministic UUID from source_id — used for upsert deduplication."""
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{ref_type}:{source_id}"))
+
+
+async def _fetch(client: httpx.AsyncClient, path: str, params: dict[str, Any]) -> dict:
+    resp = await client.get(f"{_API_BASE}/{path}", params=params, timeout=30.0)
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def _crawl_cases(client: httpx.AsyncClient, oc: str) -> list[dict]:
+    seen: set[str] = set()
+    docs: list[dict] = []
+
+    for query in _QUERIES:
+        try:
+            data = await _fetch(client, "lawSearch.do", {
+                "OC": oc, "target": "prec", "type": "JSON",
+                "query": query, "display": _DISPLAY,
+            })
+            items = data.get("PrecSearch", {}).get("prec", [])
+            if isinstance(items, dict):
+                items = [items]
+            for item in items:
+                seq = str(item.get("판례일련번호", ""))
+                if not seq or seq in seen:
+                    continue
+                seen.add(seq)
+                try:
+                    detail = await _fetch(client, "lawService.do", {
+                        "OC": oc, "target": "prec", "type": "JSON", "ID": seq,
+                    })
+                    d = detail.get("PrecService", {})
+                    raw = d.get("판례내용", "") or d.get("전문", "")
+                    content = BeautifulSoup(raw, "html.parser").get_text()[:3000]
+                    if not content.strip():
+                        continue
+                    docs.append({
+                        "type": "prec",
+                        "source_id": seq,
+                        "title": d.get("사건명", ""),
+                        "content": content,
+                        "date": d.get("선고일자", ""),
+                        "court": d.get("법원명", ""),
+                    })
+                except Exception as exc:
+                    log.warning("판례 상세 조회 실패", seq=seq, error=str(exc))
+        except Exception as exc:
+            log.warning("판례 검색 실패", query=query, error=str(exc))
+
+    return docs
+
+
+async def _crawl_laws(client: httpx.AsyncClient, oc: str) -> list[dict]:
+    seen: set[str] = set()
+    docs: list[dict] = []
+
+    for query in _QUERIES:
+        try:
+            data = await _fetch(client, "lawSearch.do", {
+                "OC": oc, "target": "law", "type": "JSON",
+                "query": query, "display": _DISPLAY,
+            })
+            items = data.get("LawSearch", {}).get("law", [])
+            if isinstance(items, dict):
+                items = [items]
+            for item in items:
+                law_id = str(item.get("법령ID", ""))
+                if not law_id or law_id in seen:
+                    continue
+                seen.add(law_id)
+                try:
+                    detail = await _fetch(client, "lawService.do", {
+                        "OC": oc, "target": "law", "type": "JSON", "ID": law_id,
+                    })
+                    d = detail.get("LawService", {})
+                    articles = d.get("조문", [])
+                    if isinstance(articles, dict):
+                        articles = [articles]
+                    content = "\n\n".join(
+                        f"{a.get('조문제목', '')}\n{a.get('조문내용', '')}".strip()
+                        for a in articles[:20]
+                        if a.get("조문제목") or a.get("조문내용")
+                    )[:3000]
+                    if not content.strip():
+                        continue
+                    docs.append({
+                        "type": "law",
+                        "source_id": law_id,
+                        "title": d.get("법령명", item.get("법령명한글", "")),
+                        "content": content,
+                        "date": d.get("공포일자", ""),
+                        "court": "",
+                    })
+                except Exception as exc:
+                    log.warning("법령 상세 조회 실패", law_id=law_id, error=str(exc))
+        except Exception as exc:
+            log.warning("법령 검색 실패", query=query, error=str(exc))
+
+    return docs
+
+
+async def run_update() -> None:
+    """Crawl 판례 + 법령 and upsert into Qdrant cases collection."""
+    oc = settings.law_api_oc
+    if not oc:
+        log.warning("LAW_API_OC not configured — skipping legal data update")
+        return
+
+    log.info("legal data update started")
+    await ensure_cases_collection()
+
+    async with httpx.AsyncClient() as http:
+        cases = await _crawl_cases(http, oc)
+        laws = await _crawl_laws(http, oc)
+
+    all_docs = cases + laws
+    log.info("crawled legal documents", cases=len(cases), laws=len(laws), total=len(all_docs))
+
+    if not all_docs:
+        log.warning("no legal documents crawled — nothing to upsert")
+        return
+
+    texts = [f"{d['title']}\n{d['content']}" for d in all_docs]
+    vectors = await embed(texts)
+
+    qdrant = _get_client()
+    points = [
+        PointStruct(
+            id=_to_uuid(d["source_id"], d["type"]),
+            vector=v,
+            payload={
+                "type": d["type"],
+                "source_id": d["source_id"],
+                "title": d["title"],
+                "content": d["content"][:1000],
+                "date": d.get("date", ""),
+                "court": d.get("court", ""),
+            },
+        )
+        for d, v in zip(all_docs, vectors)
+    ]
+
+    await qdrant.upsert(collection_name=CASES_COLLECTION_NAME, points=points)
+    log.info("legal data upserted", count=len(points))
