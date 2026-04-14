@@ -127,10 +127,14 @@ async def _call_llm(client: AsyncOpenAI, prompt: str) -> str:
             model=MODEL,
             max_tokens=1024,
             messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
         ),
         timeout=_LLM_CALL_TIMEOUT,
     )
-    return response.choices[0].message.content
+    content = response.choices[0].message.content
+    if content is None:
+        raise ValueError("OpenAI returned empty content")
+    return content
 
 
 _DOCUMENT_SUMMARY_PROMPT_TEMPLATE = """다음은 계약서의 조항별 리스크 분석 결과입니다.
