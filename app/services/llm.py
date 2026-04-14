@@ -1,4 +1,4 @@
-"""LLM service: clause risk analysis using Anthropic Claude API."""
+"""LLM service: clause risk analysis using OpenAI API."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import structlog
-from anthropic import APIStatusError, AsyncAnthropic
+from openai import APIStatusError, AsyncOpenAI
 from tenacity import (
     retry,
     retry_if_exception,
@@ -21,23 +21,23 @@ from app.config import settings
 
 log = structlog.get_logger()
 
-MODEL = "claude-3-5-sonnet-20241022"
+MODEL = "gpt-4o"
 
 # Timeout in seconds for a single LLM API call.
 _LLM_CALL_TIMEOUT = 60.0
 
-_client: AsyncAnthropic | None = None
+_client: AsyncOpenAI | None = None
 
 
-def _get_client() -> AsyncAnthropic:
+def _get_client() -> AsyncOpenAI:
     global _client
     if _client is None:
-        _client = AsyncAnthropic(api_key=settings.anthropic_api_key)
+        _client = AsyncOpenAI(api_key=settings.openai_api_key)
     return _client
 
 
 def _is_retryable(exc: BaseException) -> bool:
-    """Return True for Anthropic 429 (rate limit) and 503 (overloaded) errors."""
+    """Return True for OpenAI 429 (rate limit) and 503 (overloaded) errors."""
     if isinstance(exc, APIStatusError):
         return exc.status_code in (429, 503)
     return False
@@ -120,17 +120,98 @@ def _normalize_confidence(value: Any) -> float:
     stop=stop_after_attempt(3),
     reraise=True,
 )
-async def _call_llm(client: AsyncAnthropic, prompt: str) -> str:
-    """Call Claude API with timeout and retry on 429/503."""
-    message = await asyncio.wait_for(
-        client.messages.create(
+async def _call_llm(client: AsyncOpenAI, prompt: str) -> str:
+    """Call OpenAI API with timeout and retry on 429/503."""
+    response = await asyncio.wait_for(
+        client.chat.completions.create(
             model=MODEL,
             max_tokens=1024,
             messages=[{"role": "user", "content": prompt}],
         ),
         timeout=_LLM_CALL_TIMEOUT,
     )
-    return message.content[0].text
+    return response.choices[0].message.content
+
+
+_DOCUMENT_SUMMARY_PROMPT_TEMPLATE = """다음은 계약서의 조항별 리스크 분석 결과입니다.
+전체 계약서를 종합하여 문서 수준의 리스크 요약을 작성해주세요.
+
+조항별 분석 결과:
+{clause_summaries}
+
+통계: 전체 {total}개 조항 / 고위험 {high_count}개 / 중위험 {medium_count}개 / 저위험 {low_count}개
+
+다음 JSON 형식으로만 응답하세요:
+{{
+  "overall_risk": "HIGH|MEDIUM|LOW",
+  "summary": "계약서 전체 리스크에 대한 2-4문장 한국어 요약",
+  "key_issues": ["주요 이슈 1", "주요 이슈 2", ...]
+}}"""
+
+
+@dataclass
+class DocumentSummaryResult:
+    """Document-level risk summary aggregated from clause results."""
+
+    overall_risk: str  # HIGH | MEDIUM | LOW
+    summary: str
+    key_issues: list[str]
+
+
+async def summarize_document(
+    clause_results: list[ClauseAnalysisResult],
+) -> DocumentSummaryResult:
+    """Produce a document-level risk summary from clause analysis results."""
+    if not clause_results:
+        return DocumentSummaryResult(
+            overall_risk="LOW", summary="분석된 조항이 없습니다.", key_issues=[]
+        )
+
+    client = _get_client()
+
+    high = sum(1 for r in clause_results if r.risk_level == "HIGH")
+    medium = sum(1 for r in clause_results if r.risk_level == "MEDIUM")
+    low = sum(1 for r in clause_results if r.risk_level == "LOW")
+
+    clause_summaries = "\n".join(
+        f"[{r.risk_level}] {r.summary}" for r in clause_results if r.summary
+    )
+
+    prompt = _DOCUMENT_SUMMARY_PROMPT_TEMPLATE.format(
+        clause_summaries=clause_summaries or "(요약 없음)",
+        total=len(clause_results),
+        high_count=high,
+        medium_count=medium,
+        low_count=low,
+    )
+
+    try:
+        raw_text = await _call_llm(client, prompt)
+    except TimeoutError:
+        log.error("document summary LLM call timed out")
+        raise
+    except APIStatusError as exc:
+        log.error("document summary LLM API error", status_code=exc.status_code)
+        raise
+
+    try:
+        data = _extract_json(raw_text)
+    except (json.JSONDecodeError, AttributeError) as exc:
+        log.warning(
+            "document summary non-JSON response", error=str(exc), raw=raw_text[:200]
+        )
+        fallback_risk = "HIGH" if high > 0 else ("MEDIUM" if medium > 0 else "LOW")
+        return DocumentSummaryResult(
+            overall_risk=fallback_risk,
+            summary="문서 전체 요약을 생성하지 못했습니다.",
+            key_issues=[],
+        )
+
+    return DocumentSummaryResult(
+        overall_risk=_normalize_risk_level(data.get("overall_risk", "MEDIUM")),
+        summary=data.get("summary", ""),
+        key_issues=data.get("key_issues", []),
+    )
 
 
 async def analyze_clause(clause_text: str) -> ClauseAnalysisResult:

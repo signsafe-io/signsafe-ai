@@ -56,8 +56,6 @@ async def _run_weekly_legal_update() -> None:
 def _validate_config() -> None:
     """Fail fast if required API keys are missing."""
     missing: list[str] = []
-    if not settings.anthropic_api_key:
-        missing.append("ANTHROPIC_API_KEY")
     if not settings.openai_api_key:
         missing.append("OPENAI_API_KEY")
     if missing:

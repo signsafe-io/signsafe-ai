@@ -33,7 +33,7 @@ from typing import Any
 
 import asyncpg
 import structlog
-from anthropic import APIStatusError
+from openai import APIStatusError
 
 from app.db import (
     get_clauses_for_contract,
