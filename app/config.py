@@ -16,7 +16,6 @@ class Settings(BaseSettings):
     s3_secret_key: str = ""
     s3_bucket: str = "contracts"
 
-    anthropic_api_key: str = ""
     openai_api_key: str = ""
     law_api_oc: str = ""
 
