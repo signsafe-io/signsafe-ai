@@ -331,22 +331,36 @@ async def update_risk_analysis_summary(
         ADD COLUMN document_summary TEXT,
         ADD COLUMN overall_risk VARCHAR(10),
         ADD COLUMN key_issues JSONB;
+
+    If the columns do not exist yet (migration pending), the call is silently
+    skipped and a warning is logged. Once the migration is applied, subsequent
+    calls will persist data automatically — no code change required.
     """
     now = datetime.now(timezone.utc)
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE risk_analyses
-            SET document_summary = $1, overall_risk = $2,
-                key_issues = $3, updated_at = $4
-            WHERE id = $5
-            """,
-            document_summary,
-            overall_risk,
-            json.dumps(key_issues, ensure_ascii=False),
-            now,
-            analysis_id,
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE risk_analyses
+                SET document_summary = $1, overall_risk = $2,
+                    key_issues = $3, updated_at = $4
+                WHERE id = $5
+                """,
+                document_summary,
+                overall_risk,
+                json.dumps(key_issues, ensure_ascii=False),
+                now,
+                analysis_id,
+            )
+    except asyncpg.exceptions.UndefinedColumnError:
+        # Columns are added by a pending migration on signsafe-api side.
+        # Skip gracefully so the analysis job still completes successfully.
+        log.warning(
+            "update_risk_analysis_summary skipped — columns not yet migrated "
+            "(document_summary / overall_risk / key_issues missing on risk_analyses)",
+            analysis_id=analysis_id,
         )
+        return
     log.info(
         "risk_analysis document summary updated",
         analysis_id=analysis_id,

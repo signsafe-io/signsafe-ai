@@ -150,3 +150,37 @@
 - 이전에 저장된 행은 DEFAULT 0.5로 초기화됨
 
 **영향**: signsafe-api 마이그레이션 필요 (000006 추가, 완료)
+
+---
+
+## ADR-008: update_risk_analysis_summary 컬럼 부재 시 graceful skip
+
+**날짜**: 2026-04-14
+
+**결정**: `update_risk_analysis_summary()`에서 `asyncpg.exceptions.UndefinedColumnError` 발생 시 경고 로그만 남기고 skip한다. 에러를 전파하지 않으므로 분석 완료 흐름에 영향 없다.
+
+**배경**:
+- `risk_analyses` 테이블에 `document_summary`, `overall_risk`, `key_issues` 컬럼 추가는 signsafe-api 측 마이그레이션으로 처리
+- 마이그레이션 전까지 해당 컬럼이 없어 호출마다 DB 에러 발생
+- 기존 코드에서 `analysis.py`의 `try/except Exception`으로 잡혀 비치명적이었으나, 의도가 명확하지 않았음
+
+**구현**:
+- `db.py`의 `update_risk_analysis_summary` 내부에서 `UndefinedColumnError`를 직접 잡아 처리
+- 마이그레이션 완료 후 동일 코드가 자동으로 정상 동작 (코드 변경 불필요)
+
+**대안 검토**:
+- `analysis.py`의 `try/except` 유지: 의도가 불명확하고 모든 예외를 삼킴
+- 컬럼 존재 여부 사전 체크: 매 호출마다 `information_schema` 조회 → 오버헤드
+
+---
+
+## ADR-009: anthropic_api_key 설정 필드 제거
+
+**날짜**: 2026-04-14
+
+**결정**: `config.py`에서 `anthropic_api_key` 필드 제거
+
+**이유**:
+- ADR-003에서 LLM을 OpenAI gpt-4o로 전환하여 Anthropic SDK 미사용
+- 미사용 환경변수를 선언하면 운영자 혼란 유발
+- xquare Vault에서도 해당 키 주입 불필요
