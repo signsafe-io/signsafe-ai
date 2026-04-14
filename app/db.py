@@ -318,6 +318,97 @@ async def insert_clause_result(
     return result["id"]
 
 
+async def update_risk_analysis_summary(
+    pool: asyncpg.Pool,
+    analysis_id: str,
+    document_summary: str,
+    overall_risk: str,
+    key_issues: list[Any],
+) -> None:
+    """Update document-level summary fields on risk_analyses.
+
+    Requires migration: ALTER TABLE risk_analyses
+        ADD COLUMN document_summary TEXT,
+        ADD COLUMN overall_risk VARCHAR(10),
+        ADD COLUMN key_issues JSONB;
+    """
+    now = datetime.now(timezone.utc)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE risk_analyses
+            SET document_summary = $1, overall_risk = $2,
+                key_issues = $3, updated_at = $4
+            WHERE id = $5
+            """,
+            document_summary,
+            overall_risk,
+            json.dumps(key_issues, ensure_ascii=False),
+            now,
+            analysis_id,
+        )
+    log.info(
+        "risk_analysis document summary updated",
+        analysis_id=analysis_id,
+        overall_risk=overall_risk,
+    )
+
+
+async def get_clause_by_id(
+    pool: asyncpg.Pool,
+    clause_id: str,
+) -> asyncpg.Record | None:
+    """Return a clause row by id."""
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(
+            "SELECT id, content, label FROM clauses WHERE id = $1",
+            clause_id,
+        )
+
+
+async def get_evidence_set_with_clause(
+    pool: asyncpg.Pool,
+    evidence_set_id: str,
+) -> asyncpg.Record | None:
+    """Return evidence_set joined with its clause content and org_id."""
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(
+            """
+            SELECT es.id, es.clause_result_id, es.top_k,
+                   cr.clause_id, c.content AS clause_content,
+                   c.label AS clause_label,
+                   co.organization_id AS org_id
+            FROM evidence_sets es
+            JOIN clause_results cr ON cr.id = es.clause_result_id
+            JOIN clauses c ON c.id = cr.clause_id
+            JOIN contracts co ON co.id = c.contract_id
+            WHERE es.id = $1
+            """,
+            evidence_set_id,
+        )
+
+
+async def update_evidence_set_citations(
+    pool: asyncpg.Pool,
+    evidence_set_id: str,
+    citations: list[Any],
+) -> None:
+    """Update citations and retrieved_at for an evidence_set."""
+    now = datetime.now(timezone.utc)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE evidence_sets
+            SET citations = $1, retrieved_at = $2, updated_at = $2
+            WHERE id = $3
+            """,
+            json.dumps(citations, ensure_ascii=False),
+            now,
+            evidence_set_id,
+        )
+    log.info("evidence_set citations updated", evidence_set_id=evidence_set_id)
+
+
 async def insert_evidence_set(
     pool: asyncpg.Pool,
     evidence: dict,
