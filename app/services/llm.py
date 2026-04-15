@@ -227,7 +227,7 @@ class ClauseBoundary:
 
 
 _CLAUSE_BOUNDARY_PROMPT_TEMPLATE = """다음은 계약서에서 추출된 단락 목록입니다. 각 단락 앞에 인덱스 번호가 표시됩니다.
-계약서의 각 조항이 시작되는 단락의 인덱스와 조항명을 식별해주세요.
+각 조항이 **시작되는** 단락의 인덱스만 골라주세요.
 
 단락 목록:
 {paragraphs}
@@ -240,16 +240,58 @@ _CLAUSE_BOUNDARY_PROMPT_TEMPLATE = """다음은 계약서에서 추출된 단락
   ]
 }}
 
-주의사항:
-- start 인덱스는 0부터 시작합니다
-- 조항 제목(제N조, Article N, Section N 등)이 있으면 label에 포함하세요
-- 구분이 불분명한 경우 의미 단위로 묶어 하나의 조항으로 처리하세요
-- 짧은 머리말 단독 단락은 다음 본문과 같은 조항으로 처리하세요"""
+[경계 선택 원칙]
+1. 조항 헤더(제N조, 제N항, Article N, Section N, 1. 제목, (1) 등)가 시작되는 단락만 경계로 표시합니다.
+2. 조항 본문(을은 갑에게..., 다음 각 호..., 단, ... 등 내용 텍스트)은 절대 경계로 표시하지 않습니다.
+   본문은 앞선 조항 헤더와 동일한 조항에 속합니다.
+3. 헤더 단락과 바로 뒤따르는 본문 단락은 같은 조항으로 묶어야 합니다.
+   예) [0] "제 1조 계약 목적"  [1] "을은 갑에게 서비스를 제공한다." → [0]만 경계, [1]은 본문
+4. 줄바꿈으로 인해 헤더가 짧게 나뉘더라도 조항 번호·제목이 포함된 단락만 경계입니다.
+5. 문서 형식 다양성 대응:
+   - 한국어: 제N조, 제N항, 제N목, 제N절, N. 제목, (N) 등
+   - 영문: Article N, Section N, Clause N, N. Title
+   - 번호 없는 의미 단위: 문맥상 명확히 새 주제가 시작될 때만 경계
+6. 구분이 불분명하면 이전 조항에 포함시키세요 (경계를 적게 잡는 것이 많이 잡는 것보다 안전합니다).
+- start 인덱스는 0부터 시작합니다."""
 
 # 단락당 LLM에 전달할 최대 문자 수 (긴 단락은 잘라서 구조 파악용으로만 사용)
 _PARA_PREVIEW_LEN = 150
-# 한 번에 LLM에 보낼 최대 단락 수
-_CHUNK_SIZE = 80
+# 한 번에 LLM에 보낼 최대 단락 수.
+# GPT-4o는 128k 컨텍스트. 150자 × 500단락 ≈ 2만 토큰 → 여유롭게 전체 전송 가능.
+# 대부분의 계약서는 500단락 미만이므로 실질적으로 전체 문서를 한 번에 봄.
+_CHUNK_SIZE = 500
+# 청크 간 overlap: 이전 청크 마지막 N개 단락을 다음 청크 앞에 포함해 경계 맥락 유지.
+_OVERLAP = 10
+
+
+def _serialize_paragraphs(texts: list[str], offset: int) -> str:
+    """단락 목록을 LLM 프롬프트용 '[인덱스] 미리보기' 형태로 직렬화."""
+    return "\n".join(
+        f"[{offset + i}] {text[:_PARA_PREVIEW_LEN].replace(chr(10), ' ')}"
+        + ("..." if len(text) > _PARA_PREVIEW_LEN else "")
+        for i, text in enumerate(texts)
+    )
+
+
+def _parse_boundaries_from_response(
+    raw_text: str,
+    valid_start: int,
+    valid_end: int,
+) -> list[ClauseBoundary]:
+    """LLM 응답에서 boundaries 파싱. valid_start..valid_end 범위 외 인덱스 무시."""
+    data = _extract_json(raw_text)
+    if isinstance(data, dict):
+        data = data.get("boundaries", [])
+    if not isinstance(data, list):
+        raise ValueError("Expected list under 'boundaries' key")
+    result = []
+    for item in data:
+        start_idx = int(item.get("start", valid_start))
+        if valid_start <= start_idx < valid_end:
+            result.append(
+                ClauseBoundary(start=start_idx, label=item.get("label") or None)
+            )
+    return result
 
 
 async def extract_clause_boundaries(
@@ -257,26 +299,46 @@ async def extract_clause_boundaries(
 ) -> list[ClauseBoundary]:
     """LLM을 사용해 단락 목록에서 조항 경계를 감지한다.
 
-    단락이 _CHUNK_SIZE보다 많은 경우 청크로 나눠 처리하고 인덱스를 보정한다.
+    500단락 이하(대부분의 계약서)는 전체를 한 번에 전송해 LLM이 문서 전체 맥락을
+    보고 경계를 잡도록 한다. 500단락 초과 시에는 _OVERLAP만큼 겹치는 슬라이딩
+    윈도우로 청크를 나눠 처리하여 청크 경계에서의 누락을 방지한다.
     """
     if not paragraph_texts:
         return []
 
     client = _get_client()
-    boundaries: list[ClauseBoundary] = []
+    all_boundaries: list[ClauseBoundary] = []
 
-    # 청크 단위로 처리 (긴 문서 대응)
-    for chunk_start in range(0, len(paragraph_texts), _CHUNK_SIZE):
+    # 청크 시작 인덱스 목록 생성 (overlap 적용)
+    chunk_starts = list(range(0, len(paragraph_texts), _CHUNK_SIZE - _OVERLAP))
+    # 마지막 청크가 문서 끝까지 포함되도록 보정
+    if not chunk_starts or chunk_starts[-1] + _CHUNK_SIZE < len(paragraph_texts):
+        if len(paragraph_texts) > _CHUNK_SIZE:
+            pass  # range()가 이미 처리
+    # 단일 청크인 경우
+    if len(paragraph_texts) <= _CHUNK_SIZE:
+        chunk_starts = [0]
+
+    for chunk_idx, chunk_start in enumerate(chunk_starts):
         chunk = paragraph_texts[chunk_start : chunk_start + _CHUNK_SIZE]
+        if not chunk:
+            continue
 
-        # 단락 목록을 "인덱스: 텍스트 미리보기" 형태로 직렬화
-        para_list = "\n".join(
-            f"[{chunk_start + i}] {text[:_PARA_PREVIEW_LEN].replace(chr(10), ' ')}"
-            + ("..." if len(text) > _PARA_PREVIEW_LEN else "")
-            for i, text in enumerate(chunk)
-        )
+        # overlap 구간(이전 청크 마지막 _OVERLAP개)은 경계 감지 대상에서 제외.
+        # 이미 이전 청크에서 처리된 인덱스이므로 중복 방지.
+        new_start = chunk_start if chunk_idx == 0 else chunk_start + _OVERLAP
+        new_end = chunk_start + len(chunk)
 
+        para_list = _serialize_paragraphs(chunk, chunk_start)
         prompt = _CLAUSE_BOUNDARY_PROMPT_TEMPLATE.format(paragraphs=para_list)
+
+        log.info(
+            "clause boundary LLM call",
+            chunk_idx=chunk_idx,
+            para_range=f"{chunk_start}-{chunk_start + len(chunk) - 1}",
+            new_range=f"{new_start}-{new_end - 1}",
+            total=len(paragraph_texts),
+        )
 
         try:
             raw_text = await _call_llm(client, prompt)
@@ -286,27 +348,22 @@ async def extract_clause_boundaries(
                 chunk_start=chunk_start,
                 error=str(exc),
             )
-            # 청크 실패 시 청크의 첫 단락을 단일 조항으로 처리
-            boundaries.append(ClauseBoundary(start=chunk_start, label=None))
+            # 실패 시 새 구간 첫 단락을 단일 조항 시작으로 처리
+            all_boundaries.append(ClauseBoundary(start=new_start, label=None))
             continue
 
         try:
-            data = _extract_json(raw_text)
-            # LLM은 {"boundaries": [...]} 형식으로 반환 (json_object 모드 최상위 배열 불가)
-            if isinstance(data, dict):
-                data = data.get("boundaries", [])
-            if not isinstance(data, list):
-                raise ValueError("Expected list under 'boundaries' key")
-            for item in data:
-                start_idx = int(item.get("start", chunk_start))
-                # 인덱스 범위 검증
-                if chunk_start <= start_idx < chunk_start + len(chunk):
-                    boundaries.append(
-                        ClauseBoundary(
-                            start=start_idx,
-                            label=item.get("label") or None,
-                        )
-                    )
+            chunk_boundaries = _parse_boundaries_from_response(
+                raw_text,
+                valid_start=new_start,
+                valid_end=new_end,
+            )
+            all_boundaries.extend(chunk_boundaries)
+            log.info(
+                "clause boundary chunk done",
+                chunk_start=chunk_start,
+                found=len(chunk_boundaries),
+            )
         except (json.JSONDecodeError, AttributeError, ValueError, TypeError) as exc:
             log.warning(
                 "clause boundary JSON parse failed",
@@ -314,16 +371,21 @@ async def extract_clause_boundaries(
                 error=str(exc),
                 raw=raw_text[:200],
             )
-            boundaries.append(ClauseBoundary(start=chunk_start, label=None))
+            all_boundaries.append(ClauseBoundary(start=new_start, label=None))
 
     # 중복 제거 및 정렬
     seen: set[int] = set()
     unique: list[ClauseBoundary] = []
-    for b in sorted(boundaries, key=lambda x: x.start):
+    for b in sorted(all_boundaries, key=lambda x: x.start):
         if b.start not in seen:
             seen.add(b.start)
             unique.append(b)
 
+    log.info(
+        "clause boundaries total",
+        count=len(unique),
+        total_paragraphs=len(paragraph_texts),
+    )
     return unique
 
 
