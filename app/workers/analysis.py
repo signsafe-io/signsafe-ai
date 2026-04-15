@@ -74,6 +74,42 @@ def _law_source_url(ref_type: str, source_id: str) -> str:
     return f"https://www.law.go.kr/precInfoP.do?precSeq={source_id}"
 
 
+# 이슈 타입별 한국어 레이블
+_ISSUE_LABELS: dict[str, str] = {
+    "LIABILITY_LIMITATION": "손해배상 제한",
+    "TERMINATION_RIGHT": "일방적 계약 해지권",
+    "IP_OWNERSHIP": "지식재산권 귀속",
+    "PENALTY_CLAUSE": "위약금/페널티",
+    "FORCE_MAJEURE": "불가항력",
+    "GOVERNING_LAW": "준거법/관할",
+    "CONFIDENTIALITY": "기밀유지",
+    "INDEMNITY": "면책",
+    "PAYMENT_TERMS": "지급 조건",
+}
+
+
+def _generate_why_relevant(
+    ref_type: str,
+    issue_types: list[str],
+) -> str:
+    """Generate a brief Korean explanation of why this citation is relevant.
+
+    Uses the clause's issue types to produce a template-based explanation
+    without an additional LLM call.
+    """
+    if not issue_types:
+        if ref_type == "law":
+            return "해당 조항의 법적 근거로 활용됩니다."
+        return "유사 분쟁에서의 판단 사례로 참고됩니다."
+
+    labels = [_ISSUE_LABELS.get(it, it) for it in issue_types[:2]]
+    issue_text = " 및 ".join(labels)
+
+    if ref_type == "law":
+        return f"{issue_text} 관련 법적 기준을 규정하며, 해당 조항의 적법성 판단에 활용됩니다."
+    return f"{issue_text} 관련 분쟁에서의 판례로, 해당 조항의 법적 유효성 평가에 참고됩니다."
+
+
 def _classify_exception(exc: BaseException) -> type[RetryableError | PermanentError]:
     """Map an arbitrary exception to a retryable vs permanent category.
 
@@ -153,7 +189,9 @@ async def _analyze_single_clause(
                 "title": r.get("title")
                 or ("판례" if r.get("type") == "prec" else "법령"),
                 "snippet": r.get("content", "")[:200],
-                "whyRelevant": "",
+                "whyRelevant": _generate_why_relevant(
+                    r.get("type", "prec"), llm_result.issue_types
+                ),
                 "source": _law_source_url(
                     r.get("type", "prec"), r.get("source_id", "")
                 ),
