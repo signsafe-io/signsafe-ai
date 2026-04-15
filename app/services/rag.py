@@ -130,9 +130,9 @@ async def search_similar_clauses(
 
     query_filter = Filter(must=must) if must else None
 
-    results = await client.search(
+    response = await client.query_points(
         collection_name=COLLECTION_NAME,
-        query_vector=query_vector,
+        query=query_vector,
         limit=top_k,
         query_filter=query_filter,
         with_payload=True,
@@ -146,7 +146,7 @@ async def search_similar_clauses(
             "score": r.score,
             "payload": r.payload,
         }
-        for r in results
+        for r in response.points
     ]
 
 
@@ -178,9 +178,9 @@ async def search_legal_references(
         must.append(FieldCondition(key="type", match=MatchValue(value=ref_type)))
     query_filter = Filter(must=must) if must else None
 
-    results = await client.search(
+    response = await client.query_points(
         collection_name=CASES_COLLECTION_NAME,
-        query_vector=query_vector,
+        query=query_vector,
         limit=top_k,
         query_filter=query_filter,
         with_payload=True,
@@ -196,5 +196,5 @@ async def search_legal_references(
             "court": r.payload.get("court", ""),
             "score": r.score,
         }
-        for r in results
+        for r in response.points
     ]
