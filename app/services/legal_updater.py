@@ -27,15 +27,17 @@ _PREC_QUERIES = [
     "기밀유지",
     "지식재산권",
 ]
-# 법령 검색 키워드 (법령명 + 전체 검색, section=all)
+# 법령 검색 키워드
+# section=all 파라미터를 사용하지 않음 — target=law 시 section=all이 빈 결과를 반환함
+# (law.go.kr DRF API: target=law 기본값이 이미 법령명+본문 검색)
 _LAW_QUERIES = [
-    "약관",
-    "손해배상",
-    "계약",
-    "지식재산",
-    "하도급",
+    "약관규제법",
+    "하도급거래",
     "공정거래",
-    "개인정보",
+    "개인정보보호법",
+    "손해배상",
+    "지식재산기본법",
+    "전자상거래",
 ]
 _DISPLAY = 10
 
@@ -116,6 +118,7 @@ async def _crawl_laws(client: httpx.AsyncClient, oc: str) -> list[dict]:
 
     for query in _LAW_QUERIES:
         try:
+            # section=all 파라미터 제거: target=law 시 해당 파라미터가 빈 결과를 유발
             data = await _fetch(
                 client,
                 "lawSearch.do",
@@ -125,13 +128,28 @@ async def _crawl_laws(client: httpx.AsyncClient, oc: str) -> list[dict]:
                     "type": "JSON",
                     "query": query,
                     "display": _DISPLAY,
-                    "section": "all",
                 },
             )
-            items = data.get("LawSearch", {}).get("law", [])
-            if isinstance(items, dict):
-                items = [items]
-            elif not isinstance(items, list):
+            law_search = data.get("LawSearch", {})
+            total_cnt = law_search.get("totalCnt", 0)
+            raw_items = law_search.get("law", [])
+            log.debug(
+                "법령 검색 응답",
+                query=query,
+                total_cnt=total_cnt,
+                has_law_key="law" in law_search,
+                raw_type=type(raw_items).__name__,
+            )
+            if isinstance(raw_items, dict):
+                items: list[dict] = [raw_items]
+            elif isinstance(raw_items, list):
+                items = raw_items
+            else:
+                log.warning(
+                    "법령 검색 응답 law 키 타입 이상",
+                    query=query,
+                    raw_type=type(raw_items).__name__,
+                )
                 items = []
             for item in items:
                 law_id = str(item.get("법령일련번호", ""))
@@ -150,21 +168,38 @@ async def _crawl_laws(client: httpx.AsyncClient, oc: str) -> list[dict]:
                         },
                     )
                     d = detail.get("LawService", {})
-                    articles = d.get("조문", [])
+                    log.debug(
+                        "법령 상세 응답 키",
+                        law_id=law_id,
+                        top_keys=list(d.keys())[:10],
+                    )
+                    # law.go.kr DRF 응답에서 조문 데이터는 '조문' 또는 '법령본문' 키에 위치할 수 있음
+                    articles = d.get("조문") or d.get("법령본문") or []
                     if isinstance(articles, dict):
                         articles = [articles]
-                    content = "\n\n".join(
-                        f"{a.get('조문제목', '')}\n{a.get('조문내용', '')}".strip()
-                        for a in articles[:20]
-                        if a.get("조문제목") or a.get("조문내용")
-                    )[:3000]
+                    elif not isinstance(articles, list):
+                        articles = []
+                    content_parts: list[str] = []
+                    for a in articles[:20]:
+                        title = a.get("조문제목", "") or a.get("조문번호", "")
+                        body = a.get("조문내용", "") or a.get("조문", "")
+                        part = f"{title}\n{body}".strip()
+                        if part:
+                            content_parts.append(part)
+                    content = "\n\n".join(content_parts)[:3000]
                     if not content.strip():
-                        continue
+                        # 조문이 없을 경우 법령명만이라도 남겨 index에 포함
+                        law_name = d.get("법령명한글", "") or item.get("법령명한글", "")
+                        if not law_name:
+                            log.debug("법령 조문 없음, 건너뜀", law_id=law_id)
+                            continue
+                        content = law_name
                     docs.append(
                         {
                             "type": "law",
                             "source_id": law_id,
-                            "title": d.get("법령명", item.get("법령명한글", "")),
+                            "title": d.get("법령명한글", "")
+                            or item.get("법령명한글", ""),
                             "content": content,
                             "date": d.get("공포일자", ""),
                             "court": "",
