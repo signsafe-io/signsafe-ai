@@ -47,7 +47,12 @@ from app.db import (
 )
 from app.errors import PermanentError, RetryableError
 from app.services import rag as rag_svc
-from app.services.llm import MODEL, ClauseAnalysisResult, analyze_clause, summarize_document
+from app.services.llm import (
+    MODEL,
+    ClauseAnalysisResult,
+    analyze_clause,
+    summarize_document,
+)
 
 log = structlog.get_logger()
 
@@ -159,7 +164,8 @@ async def _analyze_single_clause(
             {
                 "id": r.get("source_id") or "",
                 "type": r.get("type", "prec"),
-                "title": r.get("title") or ("판례" if r.get("type") == "prec" else "법령"),
+                "title": r.get("title")
+                or ("판례" if r.get("type") == "prec" else "법령"),
                 "snippet": r.get("content", "")[:200],
                 "whyRelevant": "",
                 "source": f"https://www.law.go.kr/판례/{r.get('source_id', '')}",
@@ -233,9 +239,7 @@ def _build_recommended_actions(issue_types: list[str]) -> list[str]:
     return [actions_map[it] for it in issue_types if it in actions_map]
 
 
-async def _handle_retrieve_evidence(
-    pool: asyncpg.Pool, msg: dict[str, Any]
-) -> None:
+async def _handle_retrieve_evidence(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
     """Re-run RAG for an evidence set and update its citations.
 
     Message format:

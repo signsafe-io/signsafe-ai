@@ -35,8 +35,15 @@ def _seconds_until_next_monday_4am() -> float:
 
 
 async def _run_weekly_legal_update() -> None:
-    """Background task: update legal vector DB every Monday 04:00 KST."""
+    """Background task: update legal vector DB on startup and every Monday 04:00 KST."""
     from app.services.legal_updater import run_update
+
+    # 시작 시 즉시 1회 실행 — cases 컬렉션 초기 데이터 확보
+    log.info("running initial legal data update")
+    try:
+        await run_update()
+    except Exception:
+        log.exception("initial legal update failed — will retry next Monday")
 
     while True:
         wait = _seconds_until_next_monday_4am()
