@@ -122,55 +122,74 @@ async def consume(
                     queue=queue_name,
                     error=str(exc),
                 )
-                await message.ack()
+                try:
+                    await message.ack()
+                except Exception:
+                    log.exception("failed to ack unparseable message", queue=queue_name)
                 continue
 
             last_exc: BaseException | None = None
-            for attempt in range(1, _MAX_RETRIES + 1):
-                try:
-                    await handler(body)
-                    last_exc = None
-                    break  # success
-                except PermanentError as exc:
-                    log.error(
-                        "permanent error — acking message without DLQ",
-                        queue=queue_name,
-                        attempt=attempt,
-                        error=str(exc),
-                    )
-                    last_exc = exc
-                    break  # do not retry permanent errors
-                except (RetryableError, Exception) as exc:
-                    last_exc = exc
-                    if attempt < _MAX_RETRIES:
-                        delay = min(
-                            _RETRY_BASE_DELAY * (2 ** (attempt - 1)),
-                            _RETRY_MAX_DELAY,
-                        )
-                        log.warning(
-                            "retryable error — will retry",
+            try:
+                for attempt in range(1, _MAX_RETRIES + 1):
+                    try:
+                        await handler(body)
+                        last_exc = None
+                        break  # success
+                    except PermanentError as exc:
+                        log.error(
+                            "permanent error — acking message without DLQ",
                             queue=queue_name,
                             attempt=attempt,
-                            max_retries=_MAX_RETRIES,
-                            delay=delay,
                             error=str(exc),
                         )
-                        await asyncio.sleep(delay)
+                        last_exc = exc
+                        break  # do not retry permanent errors
+                    except (RetryableError, Exception) as exc:
+                        last_exc = exc
+                        if attempt < _MAX_RETRIES:
+                            delay = min(
+                                _RETRY_BASE_DELAY * (2 ** (attempt - 1)),
+                                _RETRY_MAX_DELAY,
+                            )
+                            log.warning(
+                                "retryable error — will retry",
+                                queue=queue_name,
+                                attempt=attempt,
+                                max_retries=_MAX_RETRIES,
+                                delay=delay,
+                                error=str(exc),
+                            )
+                            await asyncio.sleep(delay)
+                        else:
+                            log.error(
+                                "all retries exhausted — routing to DLQ",
+                                queue=queue_name,
+                                max_retries=_MAX_RETRIES,
+                                error=str(exc),
+                            )
+            except BaseException as exc:
+                # CancelledError, KeyboardInterrupt 등 — nack with requeue so
+                # RabbitMQ re-queues the message and prevents silent message loss.
+                last_exc = exc
+                raise
+            finally:
+                # ack/nack은 BaseException(CancelledError 포함)이 발생하더라도
+                # 반드시 시도한다. ack/nack 자체가 실패해도 예외를 전파하지 않는다.
+                # connection 종료 시 RabbitMQ가 unacked 메시지를 자동으로 재큐잉한다.
+                try:
+                    if last_exc is None:
+                        # Success
+                        await message.ack()
+                    elif isinstance(last_exc, PermanentError):
+                        # Permanent failure: ack so it does NOT go to DLQ.
+                        # The handler has already written the failure to the DB.
+                        await message.ack()
                     else:
-                        log.error(
-                            "all retries exhausted — routing to DLQ",
-                            queue=queue_name,
-                            max_retries=_MAX_RETRIES,
-                            error=str(exc),
-                        )
-
-            if last_exc is None:
-                # Success
-                await message.ack()
-            elif isinstance(last_exc, PermanentError):
-                # Permanent failure: ack so it does NOT go to DLQ.
-                # The handler has already written the failure to the DB.
-                await message.ack()
-            else:
-                # Retryable failure exhausted all attempts: nack → DLQ.
-                await message.nack(requeue=False)
+                        # Retryable failure exhausted all attempts, or BaseException:
+                        # nack → DLQ (requeue=False sends to dead-letter queue).
+                        await message.nack(requeue=False)
+                except Exception:
+                    log.exception(
+                        "failed to ack/nack message — message may be requeued on connection close",
+                        queue=queue_name,
+                    )

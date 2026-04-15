@@ -60,18 +60,24 @@
 ## ADR-003: LLM 모델 선택
 
 **날짜**: 2026-03-27
+**수정**: 2026-04-15 (ADR-003-rev1 — 실제 구현 기준으로 정정)
 
-**결정**: Anthropic `claude-3-5-sonnet-20241022`
+**결정**: OpenAI `gpt-4o`
 
 **이유**:
 - 한국어 법률 문서 이해 및 생성 품질 우수
-- 구조화된 JSON 출력 일관성 높음
-- 비용 대비 성능 최적 (claude-3-opus 대비 저렴하고 빠름)
+- 구조화된 JSON 출력 일관성 높음 (response_format=json_object 지원)
+- 비용 대비 성능 최적
 - 128K 컨텍스트로 긴 조항도 처리 가능
 
 **대안 검토**:
-- GPT-4o: 유사한 품질, 동등한 비용
-- claude-3-opus: 최고 품질이나 3-5배 비용 증가
+- Anthropic claude-3-5-sonnet: 유사한 품질, 동등한 비용 (초기 설계 시 검토)
+- gpt-4-turbo: gpt-4o 대비 느리고 비용 높음
+
+**정정 이유**:
+- 초기 ADR-003은 Anthropic Claude로 기재되었으나 실제 구현(`app/services/llm.py`,
+  `app/workers/analysis.py`)에서는 OpenAI GPT-4o와 `openai.APIStatusError`를 사용.
+- 코드와 문서의 불일치를 해소하기 위해 ADR을 실제 구현 기준으로 정정함.
 
 ---
 
