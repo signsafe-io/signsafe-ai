@@ -67,10 +67,10 @@ def _classify_exception(exc: BaseException) -> type[RetryableError | PermanentEr
     """Map an arbitrary exception to a retryable vs permanent category.
 
     Rules:
-    - Anthropic 429 (rate limit) / 503 (overloaded) → retryable
+    - OpenAI 429 (rate limit) / 503 (overloaded) → retryable
     - asyncpg connection errors → retryable
     - TimeoutError / asyncio.TimeoutError → retryable (may recover)
-    - All other Anthropic API errors → permanent (bad request, auth)
+    - All other OpenAI API errors → permanent (bad request, auth)
     - KeyError / TypeError / ValueError (malformed data) → permanent
     """
     if isinstance(exc, APIStatusError):
