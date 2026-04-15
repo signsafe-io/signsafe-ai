@@ -17,7 +17,15 @@ from app.services.rag import CASES_COLLECTION_NAME, _get_client, ensure_cases_co
 log = structlog.get_logger()
 
 _API_BASE = "https://www.law.go.kr/DRF"
-_QUERIES = ["불공정계약", "손해배상", "계약해지", "약관", "위약금", "기밀유지", "지식재산권"]
+_QUERIES = [
+    "불공정계약",
+    "손해배상",
+    "계약해지",
+    "약관",
+    "위약금",
+    "기밀유지",
+    "지식재산권",
+]
 _DISPLAY = 10
 
 
@@ -38,10 +46,17 @@ async def _crawl_cases(client: httpx.AsyncClient, oc: str) -> list[dict]:
 
     for query in _QUERIES:
         try:
-            data = await _fetch(client, "lawSearch.do", {
-                "OC": oc, "target": "prec", "type": "JSON",
-                "query": query, "display": _DISPLAY,
-            })
+            data = await _fetch(
+                client,
+                "lawSearch.do",
+                {
+                    "OC": oc,
+                    "target": "prec",
+                    "type": "JSON",
+                    "query": query,
+                    "display": _DISPLAY,
+                },
+            )
             items = data.get("PrecSearch", {}).get("prec", [])
             if isinstance(items, dict):
                 items = [items]
@@ -51,22 +66,31 @@ async def _crawl_cases(client: httpx.AsyncClient, oc: str) -> list[dict]:
                     continue
                 seen.add(seq)
                 try:
-                    detail = await _fetch(client, "lawService.do", {
-                        "OC": oc, "target": "prec", "type": "JSON", "ID": seq,
-                    })
+                    detail = await _fetch(
+                        client,
+                        "lawService.do",
+                        {
+                            "OC": oc,
+                            "target": "prec",
+                            "type": "JSON",
+                            "ID": seq,
+                        },
+                    )
                     d = detail.get("PrecService", {})
                     raw = d.get("판례내용", "") or d.get("전문", "")
                     content = BeautifulSoup(raw, "html.parser").get_text()[:3000]
                     if not content.strip():
                         continue
-                    docs.append({
-                        "type": "prec",
-                        "source_id": seq,
-                        "title": d.get("사건명", ""),
-                        "content": content,
-                        "date": d.get("선고일자", ""),
-                        "court": d.get("법원명", ""),
-                    })
+                    docs.append(
+                        {
+                            "type": "prec",
+                            "source_id": seq,
+                            "title": d.get("사건명", ""),
+                            "content": content,
+                            "date": d.get("선고일자", ""),
+                            "court": d.get("법원명", ""),
+                        }
+                    )
                 except Exception as exc:
                     log.warning("판례 상세 조회 실패", seq=seq, error=str(exc))
         except Exception as exc:
@@ -81,10 +105,17 @@ async def _crawl_laws(client: httpx.AsyncClient, oc: str) -> list[dict]:
 
     for query in _QUERIES:
         try:
-            data = await _fetch(client, "lawSearch.do", {
-                "OC": oc, "target": "law", "type": "JSON",
-                "query": query, "display": _DISPLAY,
-            })
+            data = await _fetch(
+                client,
+                "lawSearch.do",
+                {
+                    "OC": oc,
+                    "target": "law",
+                    "type": "JSON",
+                    "query": query,
+                    "display": _DISPLAY,
+                },
+            )
             items = data.get("LawSearch", {}).get("law", [])
             if isinstance(items, dict):
                 items = [items]
@@ -94,9 +125,16 @@ async def _crawl_laws(client: httpx.AsyncClient, oc: str) -> list[dict]:
                     continue
                 seen.add(law_id)
                 try:
-                    detail = await _fetch(client, "lawService.do", {
-                        "OC": oc, "target": "law", "type": "JSON", "ID": law_id,
-                    })
+                    detail = await _fetch(
+                        client,
+                        "lawService.do",
+                        {
+                            "OC": oc,
+                            "target": "law",
+                            "type": "JSON",
+                            "ID": law_id,
+                        },
+                    )
                     d = detail.get("LawService", {})
                     articles = d.get("조문", [])
                     if isinstance(articles, dict):
@@ -108,14 +146,16 @@ async def _crawl_laws(client: httpx.AsyncClient, oc: str) -> list[dict]:
                     )[:3000]
                     if not content.strip():
                         continue
-                    docs.append({
-                        "type": "law",
-                        "source_id": law_id,
-                        "title": d.get("법령명", item.get("법령명한글", "")),
-                        "content": content,
-                        "date": d.get("공포일자", ""),
-                        "court": "",
-                    })
+                    docs.append(
+                        {
+                            "type": "law",
+                            "source_id": law_id,
+                            "title": d.get("법령명", item.get("법령명한글", "")),
+                            "content": content,
+                            "date": d.get("공포일자", ""),
+                            "court": "",
+                        }
+                    )
                 except Exception as exc:
                     log.warning("법령 상세 조회 실패", law_id=law_id, error=str(exc))
         except Exception as exc:
@@ -139,7 +179,9 @@ async def run_update() -> None:
         laws = await _crawl_laws(http, oc)
 
     all_docs = cases + laws
-    log.info("crawled legal documents", cases=len(cases), laws=len(laws), total=len(all_docs))
+    log.info(
+        "crawled legal documents", cases=len(cases), laws=len(laws), total=len(all_docs)
+    )
 
     if not all_docs:
         log.warning("no legal documents crawled — nothing to upsert")
