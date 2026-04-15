@@ -63,6 +63,17 @@ def _new_id() -> str:
     return str(uuid.uuid4()).replace("-", "")[:26]
 
 
+def _law_source_url(ref_type: str, source_id: str) -> str:
+    """Return the canonical law.go.kr URL for a 판례 or 법령 reference."""
+    if not source_id:
+        return ""
+    if ref_type == "law":
+        # 법령 상세 페이지: lsiSeq = 법령일련번호 (MST)
+        return f"https://www.law.go.kr/lsInfoP.do?lsiSeq={source_id}"
+    # 판례 상세 페이지: precSeq = 판례일련번호
+    return f"https://www.law.go.kr/precInfoP.do?precSeq={source_id}"
+
+
 def _classify_exception(exc: BaseException) -> type[RetryableError | PermanentError]:
     """Map an arbitrary exception to a retryable vs permanent category.
 
@@ -143,7 +154,9 @@ async def _analyze_single_clause(
                 or ("판례" if r.get("type") == "prec" else "법령"),
                 "snippet": r.get("content", "")[:200],
                 "whyRelevant": "",
-                "source": f"https://www.law.go.kr/판례/{r.get('source_id', '')}",
+                "source": _law_source_url(
+                    r.get("type", "prec"), r.get("source_id", "")
+                ),
                 "score": r.get("score"),
                 "date": r.get("date", ""),
                 "court": r.get("court", ""),
