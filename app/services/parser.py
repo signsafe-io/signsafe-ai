@@ -1,13 +1,11 @@
 """Document parser: extracts clauses from PDF and DOCX files.
 
 조항 분절 전략:
-1. 한국어 계약서 조항 헤더 패턴 감지:
-   - 제N조, 제N항, 제N목 (한글 숫자 포함)
-   - 숫자+점 패턴: 1. / 1) / (1) / ①
-   - 영문 Article / Section / Clause + 숫자
-2. 헤더가 감지되면 새 조항 시작으로 처리
-3. 헤더가 없는 경우 빈 줄 기준 단락 분절 후 의미 단위 병합
-4. 최소 길이 30자, 최대 길이 3000자로 조항 크기 제어
+1. PDF/DOCX에서 원시 단락(text, page, anchor)을 추출한다.
+2. LLM이 단락 목록을 분석해 조항 경계(start 인덱스, label)를 반환한다.
+3. 경계 정보를 바탕으로 단락들을 Clause 객체로 조립한다.
+4. LLM 호출 실패 시 정규식 기반 폴백(_KO_HEADER)을 사용한다.
+5. 최소 길이 30자, 최대 길이 3000자로 조항 크기 제어.
 """
 
 from __future__ import annotations
@@ -52,10 +50,9 @@ class Clause:
 
 
 # ---------------------------------------------------------------------------
-# Regex patterns for clause header detection
+# Regex fallback patterns for clause header detection
 # ---------------------------------------------------------------------------
 
-# Korean article/section numbers (제1조, 제1항, 제1목, 제1절)
 _KO_HEADER = re.compile(
     r"^(제\s*\d+\s*[조항목절]"
     r"|제\s*[일이삼사오육칠팔구십백]+\s*[조항목절]"
@@ -72,62 +69,81 @@ _KO_HEADER = re.compile(
 _MIN_CLAUSE_LEN = 30
 _MAX_CLAUSE_LEN = 3000
 
+# ---------------------------------------------------------------------------
+# Raw paragraph types
+# ---------------------------------------------------------------------------
+
+# (text, page_number, anchor_or_none)
+RawParagraph = tuple[str, int, Anchor | None]
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
 
 def _extract_label(text: str) -> str | None:
-    """Extract a short label from the first line of a clause."""
     first_line = text.strip().split("\n")[0].strip()
     if len(first_line) <= 100:
         return first_line or None
     return first_line[:100]
 
 
-def _split_into_clauses(
-    paragraphs: list[tuple[str, int, Anchor | None]],
-) -> list[Clause]:
-    """Split paragraphs into clauses based on header detection.
+def _flush_lines(
+    lines: list[str],
+    page_start: int,
+    page_end: int,
+    anchor: Anchor | None,
+    label: str | None,
+    char_offset: int,
+    out: list[Clause],
+) -> int:
+    """Merge lines into Clause(s), appending to out. Returns updated char_offset."""
+    merged = "\n".join(lines).strip()
+    if len(merged) < _MIN_CLAUSE_LEN:
+        return char_offset
 
-    Each paragraph is (text, page_number, anchor).
-    """
+    if len(merged) > _MAX_CLAUSE_LEN:
+        sub_parts = [
+            merged[i : i + _MAX_CLAUSE_LEN]
+            for i in range(0, len(merged), _MAX_CLAUSE_LEN)
+        ]
+    else:
+        sub_parts = [merged]
+
+    for part in sub_parts:
+        out.append(
+            Clause(
+                text=part,
+                label=label,
+                page_start=page_start,
+                page_end=page_end,
+                anchor=anchor,
+                start_offset=char_offset,
+                end_offset=char_offset + len(part),
+            )
+        )
+        char_offset += len(part) + 1
+
+    return char_offset
+
+
+# ---------------------------------------------------------------------------
+# Regex-based clause splitter (fallback)
+# ---------------------------------------------------------------------------
+
+
+def _split_into_clauses_regex(
+    paragraphs: list[RawParagraph],
+) -> list[Clause]:
+    """Split paragraphs into clauses using regex header detection (fallback)."""
     clauses: list[Clause] = []
     current_lines: list[str] = []
-    current_page_start: int = 1
-    current_page_end: int = 1
+    current_page_start = 1
+    current_page_end = 1
     current_anchor: Anchor | None = None
     current_label: str | None = None
     char_offset = 0
-
-    def flush() -> None:
-        nonlocal current_lines, current_page_start, current_page_end
-        nonlocal current_anchor, current_label, char_offset
-
-        merged = "\n".join(current_lines).strip()
-        if len(merged) >= _MIN_CLAUSE_LEN:
-            # Split oversized clauses at paragraph boundaries.
-            if len(merged) > _MAX_CLAUSE_LEN:
-                sub_parts = [
-                    merged[i : i + _MAX_CLAUSE_LEN]
-                    for i in range(0, len(merged), _MAX_CLAUSE_LEN)
-                ]
-            else:
-                sub_parts = [merged]
-
-            for part in sub_parts:
-                clauses.append(
-                    Clause(
-                        text=part,
-                        label=current_label,
-                        page_start=current_page_start,
-                        page_end=current_page_end,
-                        anchor=current_anchor,
-                        start_offset=char_offset,
-                        end_offset=char_offset + len(part),
-                    )
-                )
-                char_offset += len(part) + 1
-
-        current_lines = []
-        current_label = None
-        current_anchor = None
 
     for text, page_num, anchor in paragraphs:
         if not text.strip():
@@ -137,7 +153,16 @@ def _split_into_clauses(
         is_header = bool(_KO_HEADER.match(first_line.strip()))
 
         if is_header and current_lines:
-            flush()
+            char_offset = _flush_lines(
+                current_lines,
+                current_page_start,
+                current_page_end,
+                current_anchor,
+                current_label,
+                char_offset,
+                clauses,
+            )
+            current_lines = []
             current_page_start = page_num
             current_page_end = page_num
             current_anchor = anchor
@@ -153,41 +178,97 @@ def _split_into_clauses(
             current_lines.append(text)
 
     if current_lines:
-        flush()
+        _flush_lines(
+            current_lines,
+            current_page_start,
+            current_page_end,
+            current_anchor,
+            current_label,
+            char_offset,
+            clauses,
+        )
 
     return clauses
 
 
 # ---------------------------------------------------------------------------
-# PDF parser
+# LLM-boundary-based clause assembler
 # ---------------------------------------------------------------------------
 
 
-def _parse_pdf(data: bytes) -> list[Clause]:
-    """Parse PDF bytes into clauses using PyMuPDF."""
+def clauses_from_boundaries(
+    paragraphs: list[RawParagraph],
+    boundaries: list[Any],  # list[ClauseBoundary] — avoid circular import
+) -> list[Clause]:
+    """Assemble Clause objects using LLM-detected boundaries.
+
+    boundaries must be sorted by .start (ascending) and contain no duplicates.
+    Each boundary marks the first paragraph of a new clause.
+    """
+    if not boundaries or not paragraphs:
+        return []
+
+    clauses: list[Clause] = []
+    char_offset = 0
+
+    # Convert boundaries to (start_idx, label) pairs and add a sentinel.
+    breakpoints = [(b.start, b.label) for b in boundaries]
+    breakpoints.append((len(paragraphs), None))  # sentinel
+
+    for i, (start_idx, label) in enumerate(breakpoints[:-1]):
+        end_idx = breakpoints[i + 1][0]
+
+        chunk = paragraphs[start_idx:end_idx]
+        if not chunk:
+            continue
+
+        lines = [t for t, _, _ in chunk if t.strip()]
+        pages = [p for _, p, _ in chunk]
+        first_anchor = next((a for _, _, a in chunk if a is not None), None)
+
+        page_start = pages[0] if pages else 1
+        page_end = pages[-1] if pages else 1
+
+        # Use LLM-provided label; fall back to first-line extraction.
+        effective_label = label or _extract_label("\n".join(lines)) if lines else None
+
+        char_offset = _flush_lines(
+            lines,
+            page_start,
+            page_end,
+            first_anchor,
+            effective_label,
+            char_offset,
+            clauses,
+        )
+
+    return clauses
+
+
+# ---------------------------------------------------------------------------
+# Raw paragraph extractors (sync, CPU-bound)
+# ---------------------------------------------------------------------------
+
+
+def _extract_paragraphs_pdf(data: bytes) -> list[RawParagraph]:
+    """Extract raw (text, page, anchor) tuples from PDF bytes using PyMuPDF."""
     import fitz  # type: ignore[import-untyped]
 
     doc = fitz.open(stream=data, filetype="pdf")
-    paragraphs: list[tuple[str, int, Anchor | None]] = []
+    paragraphs: list[RawParagraph] = []
 
     for page_idx in range(len(doc)):
         page = doc[page_idx]
         page_num = page_idx + 1
-
-        # Page dimensions for normalizing coordinates to 0-1 fractions.
-        # The frontend (RiskOverlay.tsx) expects normalized coordinates that
-        # it multiplies by the rendered page size.
         page_width = page.rect.width or 1.0
         page_height = page.rect.height or 1.0
 
-        # Extract text blocks with position info.
-        blocks = page.get_text("blocks")  # (x0, y0, x1, y1, text, block_no, block_type)
+        blocks = page.get_text("blocks")
         for block in blocks:
             x0, y0, x1, y1, text, *_ = block
             text = text.strip()
             if not text:
                 continue
-            # Normalize coordinates to [0, 1] relative to the page dimensions.
             anchor = Anchor(
                 x=float(x0) / page_width,
                 y=float(y0) / page_height,
@@ -197,60 +278,70 @@ def _parse_pdf(data: bytes) -> list[Clause]:
             paragraphs.append((text, page_num, anchor))
 
     doc.close()
-    return _split_into_clauses(paragraphs)
+    return paragraphs
 
 
-# ---------------------------------------------------------------------------
-# DOCX parser
-# ---------------------------------------------------------------------------
-
-
-def _parse_docx(data: bytes) -> list[Clause]:
-    """Parse DOCX bytes into clauses using python-docx."""
+def _extract_paragraphs_docx(data: bytes) -> list[RawParagraph]:
+    """Extract raw (text, page, anchor) tuples from DOCX bytes using python-docx."""
     from docx import Document  # type: ignore[import-untyped]
 
     doc = Document(io.BytesIO(data))
-    paragraphs: list[tuple[str, int, Anchor | None]] = []
-
+    paragraphs: list[RawParagraph] = []
     for para in doc.paragraphs:
         text = para.text.strip()
         if text:
             paragraphs.append((text, 1, None))
-
-    return _split_into_clauses(paragraphs)
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
+    return paragraphs
 
 
-def parse_sync(file_path: Path) -> list[Clause]:
-    """Parse a PDF or DOCX file synchronously and return a list of Clause objects.
+def extract_paragraphs_sync(file_path: Path) -> list[RawParagraph]:
+    """Extract raw paragraphs from a PDF or DOCX file (sync, run in thread pool).
 
-    This is the canonical implementation. Use this function directly when running
-    in a thread (e.g. via asyncio.run_in_executor) to avoid blocking the event loop.
+    Returns a list of (text, page_number, anchor) tuples. Does NOT perform
+    clause splitting — use LLM boundaries + clauses_from_boundaries(), or
+    fall back to _split_into_clauses_regex() if LLM is unavailable.
     """
     data = file_path.read_bytes()
     suffix = file_path.suffix.lower()
 
-    log.info("parsing document", path=str(file_path), suffix=suffix, size=len(data))
+    log.info("extracting paragraphs", path=str(file_path), suffix=suffix, size=len(data))
 
     if suffix == ".pdf":
-        clauses = _parse_pdf(data)
+        paragraphs = _extract_paragraphs_pdf(data)
     elif suffix in (".docx", ".doc"):
-        clauses = _parse_docx(data)
+        paragraphs = _extract_paragraphs_docx(data)
     else:
         raise ValueError(f"Unsupported file type: {suffix}")
 
-    log.info("parsing complete", clause_count=len(clauses))
+    log.info("paragraph extraction complete", count=len(paragraphs))
+    return paragraphs
+
+
+# ---------------------------------------------------------------------------
+# Public API (regex-only, kept for backward compatibility / testing)
+# ---------------------------------------------------------------------------
+
+# Import Any here to satisfy clauses_from_boundaries signature without
+# a circular import from llm.py.
+from typing import Any  # noqa: E402
+
+
+def parse_sync(file_path: Path) -> list[Clause]:
+    """Parse a PDF or DOCX file synchronously using regex-based clause splitting.
+
+    This is the regex-only fallback path. The primary ingestion pipeline calls
+    extract_paragraphs_sync() then uses LLM-based boundary detection instead.
+    """
+    paragraphs = extract_paragraphs_sync(file_path)
+    clauses = _split_into_clauses_regex(paragraphs)
+    log.info("regex parse complete", clause_count=len(clauses))
     return clauses
 
 
 async def parse(file_path: Path) -> list[Clause]:
     """Async shim — kept for backward compatibility.
 
-    Prefer calling ``parse_sync`` via ``loop.run_in_executor`` so that the
+    Prefer calling parse_sync via loop.run_in_executor so that the
     synchronous C library (PyMuPDF) does not block the event loop.
     """
     loop = asyncio.get_running_loop()

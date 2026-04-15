@@ -153,34 +153,35 @@
 
 ---
 
-## ADR-008: update_risk_analysis_summary 컬럼 부재 시 graceful skip
+## ADR-008: 문서 전체 요약 및 RETRIEVE_EVIDENCE 구현
 
-**날짜**: 2026-04-14
+**날짜**: 2026-04-07
 
-**결정**: `update_risk_analysis_summary()`에서 `asyncpg.exceptions.UndefinedColumnError` 발생 시 경고 로그만 남기고 skip한다. 에러를 전파하지 않으므로 분석 완료 흐름에 영향 없다.
+**결정**:
+1. 조항 분석 완료 후 LLM을 한 번 더 호출하여 문서 수준 리스크 요약 생성
+2. `RETRIEVE_EVIDENCE` 메시지를 no-op에서 실제 RAG 재조회로 교체
 
 **배경**:
-- `risk_analyses` 테이블에 `document_summary`, `overall_risk`, `key_issues` 컬럼 추가는 signsafe-api 측 마이그레이션으로 처리
-- 마이그레이션 전까지 해당 컬럼이 없어 호출마다 DB 에러 발생
-- 기존 코드에서 `analysis.py`의 `try/except Exception`으로 잡혀 비치명적이었으나, 의도가 명확하지 않았음
+- R-001 요구사항: "문서 아래 문서 요약" — 조항별 분석만으로는 전체 리스크 파악 어려움
+- R-003 요구사항: RAG 근거 패널에서 출처 URL 클릭 네비게이션 필요
 
-**구현**:
-- `db.py`의 `update_risk_analysis_summary` 내부에서 `UndefinedColumnError`를 직접 잡아 처리
-- 마이그레이션 완료 후 동일 코드가 자동으로 정상 동작 (코드 변경 불필요)
+**문서 요약 설계**:
+- `llm.summarize_document(clause_results)` — 성공한 조항 결과 목록을 받아 전체 요약 생성
+- 출력: `overall_risk`, `summary`, `key_issues`
+- DB 저장: `risk_analyses.document_summary`, `overall_risk`, `key_issues` (JSONB)
+- 요약 실패는 non-fatal — 로그 후 continue, 분석 완료 상태 유지
 
-**대안 검토**:
-- `analysis.py`의 `try/except` 유지: 의도가 불명확하고 모든 예외를 삼킴
-- 컬럼 존재 여부 사전 체크: 매 호출마다 `information_schema` 조회 → 오버헤드
+**RETRIEVE_EVIDENCE 설계**:
+- `evidenceSetId` → DB에서 연결된 조항 텍스트 조회
+- RAG 재조회 → 유사 조항 top-k 검색
+- 각 citation에 `/contracts/{contractId}/clauses/{clauseId}` URL 포함
+- DB `evidence_sets.citations` 및 `retrieved_at` 갱신
 
----
-
-## ADR-009: anthropic_api_key 설정 필드 제거
-
-**날짜**: 2026-04-14
-
-**결정**: `config.py`에서 `anthropic_api_key` 필드 제거
-
-**이유**:
-- ADR-003에서 LLM을 OpenAI gpt-4o로 전환하여 Anthropic SDK 미사용
-- 미사용 환경변수를 선언하면 운영자 혼란 유발
-- xquare Vault에서도 해당 키 주입 불필요
+**영향**:
+- signsafe-api 마이그레이션 필요:
+  ```sql
+  ALTER TABLE risk_analyses
+    ADD COLUMN document_summary TEXT,
+    ADD COLUMN overall_risk VARCHAR(10),
+    ADD COLUMN key_issues JSONB;
+  ```

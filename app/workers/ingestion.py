@@ -51,6 +51,7 @@ from app.db import (
 )
 from app.errors import PermanentError, RetryableError
 from app.services import embeddings as emb_svc
+from app.services import llm as llm_svc
 from app.services import parser as parser_svc
 from app.services import rag as rag_svc
 
@@ -88,12 +89,12 @@ def _clause_id_to_qdrant_id(clause_id: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_OID, clause_id))
 
 
-async def _download_and_parse(
+async def _download_and_extract_paragraphs(
     loop: asyncio.AbstractEventLoop,
     file_path: str,
     tmp_path: pathlib.Path,
 ) -> list[Any]:
-    """Download file from S3 and parse it into raw clauses."""
+    """Download file from S3 and extract raw paragraphs (text, page, anchor)."""
     try:
         await loop.run_in_executor(
             None, functools.partial(_download_file, file_path, tmp_path)
@@ -110,17 +111,45 @@ async def _download_and_parse(
 
     log.info("file downloaded", path=str(tmp_path), size=tmp_path.stat().st_size)
 
-    # CPU-bound + sync C library; offload to thread pool to avoid blocking
-    # the event loop shared with the analysis worker.
+    # CPU-bound + sync C library; offload to thread pool.
     try:
-        clauses = await loop.run_in_executor(
-            None, functools.partial(parser_svc.parse_sync, tmp_path)
+        paragraphs = await loop.run_in_executor(
+            None, functools.partial(parser_svc.extract_paragraphs_sync, tmp_path)
         )
     except Exception as exc:
         # Parser errors are permanent — the file content won't change on retry.
         raise PermanentError(f"Document parse error: {exc}") from exc
 
-    log.info("parsing complete", clause_count=len(clauses))
+    log.info("paragraph extraction complete", paragraph_count=len(paragraphs))
+    return paragraphs
+
+
+async def _split_clauses_with_llm(
+    paragraphs: list[Any],
+) -> list[Any]:
+    """Use LLM to detect clause boundaries; fall back to regex on failure."""
+    paragraph_texts = [text for text, _, _ in paragraphs]
+
+    try:
+        boundaries = await llm_svc.extract_clause_boundaries(paragraph_texts)
+        if boundaries:
+            clauses = parser_svc.clauses_from_boundaries(paragraphs, boundaries)
+            log.info(
+                "LLM clause extraction complete",
+                boundary_count=len(boundaries),
+                clause_count=len(clauses),
+            )
+            return clauses
+        log.warning("LLM returned no boundaries — falling back to regex")
+    except Exception as exc:
+        log.warning(
+            "LLM clause boundary detection failed — falling back to regex",
+            error=str(exc),
+        )
+
+    # Regex fallback
+    clauses = parser_svc._split_into_clauses_regex(paragraphs)
+    log.info("regex fallback clause split complete", clause_count=len(clauses))
     return clauses
 
 
@@ -202,7 +231,10 @@ async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
 
     try:
         loop = asyncio.get_running_loop()
-        clauses = await _download_and_parse(loop, file_path, tmp_path)
+        paragraphs = await _download_and_extract_paragraphs(loop, file_path, tmp_path)
+
+        # LLM 조항 분절 (실패 시 정규식 폴백)
+        clauses = await _split_clauses_with_llm(paragraphs)
 
         # Step 2 → chunking
         await update_ingestion_job(

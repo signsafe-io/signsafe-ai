@@ -218,6 +218,110 @@ async def summarize_document(
     )
 
 
+@dataclass
+class ClauseBoundary:
+    """LLM이 감지한 단일 조항의 경계 정보."""
+
+    start: int  # 단락 인덱스 (0-based)
+    label: str | None  # 조항명, 없으면 None
+
+
+_CLAUSE_BOUNDARY_PROMPT_TEMPLATE = """다음은 계약서에서 추출된 단락 목록입니다. 각 단락 앞에 인덱스 번호가 표시됩니다.
+계약서의 각 조항이 시작되는 단락의 인덱스와 조항명을 식별해주세요.
+
+단락 목록:
+{paragraphs}
+
+다음 JSON 형식으로만 응답하세요:
+[
+  {{"start": <단락 인덱스>, "label": "<조항 제목 또는 null>"}},
+  ...
+]
+
+주의사항:
+- start 인덱스는 0부터 시작합니다
+- 조항 제목(제N조, Article N, Section N 등)이 있으면 label에 포함하세요
+- 구분이 불분명한 경우 의미 단위로 묶어 하나의 조항으로 처리하세요
+- 짧은 머리말 단독 단락은 다음 본문과 같은 조항으로 처리하세요"""
+
+# 단락당 LLM에 전달할 최대 문자 수 (긴 단락은 잘라서 구조 파악용으로만 사용)
+_PARA_PREVIEW_LEN = 150
+# 한 번에 LLM에 보낼 최대 단락 수
+_CHUNK_SIZE = 80
+
+
+async def extract_clause_boundaries(
+    paragraph_texts: list[str],
+) -> list[ClauseBoundary]:
+    """LLM을 사용해 단락 목록에서 조항 경계를 감지한다.
+
+    단락이 _CHUNK_SIZE보다 많은 경우 청크로 나눠 처리하고 인덱스를 보정한다.
+    """
+    if not paragraph_texts:
+        return []
+
+    client = _get_client()
+    boundaries: list[ClauseBoundary] = []
+
+    # 청크 단위로 처리 (긴 문서 대응)
+    for chunk_start in range(0, len(paragraph_texts), _CHUNK_SIZE):
+        chunk = paragraph_texts[chunk_start : chunk_start + _CHUNK_SIZE]
+
+        # 단락 목록을 "인덱스: 텍스트 미리보기" 형태로 직렬화
+        para_list = "\n".join(
+            f"[{chunk_start + i}] {text[:_PARA_PREVIEW_LEN].replace(chr(10), ' ')}"
+            + ("..." if len(text) > _PARA_PREVIEW_LEN else "")
+            for i, text in enumerate(chunk)
+        )
+
+        prompt = _CLAUSE_BOUNDARY_PROMPT_TEMPLATE.format(paragraphs=para_list)
+
+        try:
+            raw_text = await _call_llm(client, prompt)
+        except (TimeoutError, APIStatusError) as exc:
+            log.warning(
+                "clause boundary LLM call failed for chunk",
+                chunk_start=chunk_start,
+                error=str(exc),
+            )
+            # 청크 실패 시 청크의 첫 단락을 단일 조항으로 처리
+            boundaries.append(ClauseBoundary(start=chunk_start, label=None))
+            continue
+
+        try:
+            data = _extract_json(raw_text)
+            if not isinstance(data, list):
+                raise ValueError("Expected JSON array")
+            for item in data:
+                start_idx = int(item.get("start", chunk_start))
+                # 인덱스 범위 검증
+                if chunk_start <= start_idx < chunk_start + len(chunk):
+                    boundaries.append(
+                        ClauseBoundary(
+                            start=start_idx,
+                            label=item.get("label") or None,
+                        )
+                    )
+        except (json.JSONDecodeError, AttributeError, ValueError, TypeError) as exc:
+            log.warning(
+                "clause boundary JSON parse failed",
+                chunk_start=chunk_start,
+                error=str(exc),
+                raw=raw_text[:200],
+            )
+            boundaries.append(ClauseBoundary(start=chunk_start, label=None))
+
+    # 중복 제거 및 정렬
+    seen: set[int] = set()
+    unique: list[ClauseBoundary] = []
+    for b in sorted(boundaries, key=lambda x: x.start):
+        if b.start not in seen:
+            seen.add(b.start)
+            unique.append(b)
+
+    return unique
+
+
 async def analyze_clause(clause_text: str) -> ClauseAnalysisResult:
     """Run LLM risk analysis on a single clause and return structured result."""
     client = _get_client()
