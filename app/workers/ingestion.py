@@ -1,4 +1,4 @@
-"""Document ingestion worker: parses documents and stores embeddings.
+"""Document ingestion worker: parses documents and stores clauses in DB.
 
 Message format (from signsafe-api/internal/queue/rabbitmq.go):
     {
@@ -8,22 +8,19 @@ Message format (from signsafe-api/internal/queue/rabbitmq.go):
     }
 
 Processing pipeline:
-    1. Receive message → confirm ingestion_job exists in DB
-    2. Job status → parsing, progress 0%
-    3. Download file from S3
-    4. Parse into clauses
-    5. Job status → chunking, progress 40%
-    6. Batch-insert clauses to DB
-    7. Job status → indexing, progress 70%
-    8. Generate embeddings → upsert to Qdrant
-    9. Job status → completed, progress 100%
-   10. On failure → job status failed, store error message
+    1. Job status → parsing, progress 0%
+    2. Download file from S3, extract paragraphs
+    3. LLM-based clause boundary detection (regex fallback on failure)
+    4. Job status → chunking, progress 60%
+    5. Batch-insert clauses to DB
+    6. Job status → completed, progress 100%
+    7. On failure → job status failed, store error message
 
 Error classification:
     PermanentError — missing required fields, unsupported file type, PDF parse
         errors. Message is acked; no DLQ routing.
-    RetryableError — S3 download failures, DB connection errors, Qdrant
-        unavailability. Consumer retries with exponential back-off.
+    RetryableError — S3 download failures, DB connection errors. Consumer
+        retries with exponential back-off.
 """
 
 from __future__ import annotations
@@ -44,16 +41,13 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 from app.config import settings
 from app.db import (
-    get_org_id_for_contract,
     insert_clauses_batch,
     update_contract_status,
     update_ingestion_job,
 )
 from app.errors import PermanentError, RetryableError
-from app.services import embeddings as emb_svc
 from app.services import llm as llm_svc
 from app.services import parser as parser_svc
-from app.services import rag as rag_svc
 
 log = structlog.get_logger()
 
@@ -78,15 +72,6 @@ def _guess_suffix(file_path: str) -> str:
     """Return the file suffix from the S3 key."""
     ext = pathlib.Path(file_path).suffix.lower()
     return ext if ext else ".pdf"
-
-
-def _clause_id_to_qdrant_id(clause_id: str) -> str:
-    """Convert a 26-char alphanumeric ID to a UUID string for Qdrant.
-
-    Qdrant requires point IDs to be unsigned integers or UUID strings.
-    We pad/hash to produce a deterministic UUID.
-    """
-    return str(uuid.uuid5(uuid.NAMESPACE_OID, clause_id))
 
 
 async def _download_and_extract_paragraphs(
@@ -180,32 +165,6 @@ def _build_clause_dicts(
     return clause_dicts
 
 
-def _build_qdrant_points(
-    clause_dicts: list[dict[str, Any]],
-    vectors: list[list[float]],
-    contract_id: str,
-    org_id: str | None,
-    created_at: datetime,
-) -> list[dict[str, Any]]:
-    """Assemble Qdrant point dicts from clause dicts and embedding vectors."""
-    return [
-        {
-            "id": _clause_id_to_qdrant_id(c["id"]),
-            "vector": vectors[i],
-            "payload": {
-                "clause_id": c["id"],
-                "contract_id": contract_id,
-                "label": c.get("label"),
-                "content": c["content"][:500],  # truncated for RAG snippet display
-                "org_id": org_id,
-                "created_at": created_at.isoformat(),
-                "created_at_ts": created_at.timestamp(),
-            },
-        }
-        for i, c in enumerate(clause_dicts)
-    ]
-
-
 async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
     # Validate required fields — raise PermanentError if missing
     try:
@@ -241,7 +200,7 @@ async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
             pool,
             job_id,
             status="chunking",
-            progress=40,
+            progress=60,
             current_step="조항 분절 완료, DB 저장 중",
         )
 
@@ -257,37 +216,7 @@ async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
 
         log.info("clauses saved to DB", count=len(clause_dicts))
 
-        # Step 3 → indexing
-        await update_ingestion_job(
-            pool,
-            job_id,
-            status="indexing",
-            progress=70,
-            current_step="임베딩 생성 및 Qdrant 저장 중",
-        )
-
-        await rag_svc.ensure_collection()
-
-        try:
-            org_id = await get_org_id_for_contract(pool, contract_id)
-        except asyncpg.PostgresConnectionError as exc:
-            raise RetryableError(f"DB connection error fetching org_id: {exc}") from exc
-
-        if org_id is None:
-            log.warning(
-                "org_id not found for contract — Qdrant points will have null org_id",
-                contract_id=contract_id,
-            )
-
-        texts = [c["content"] for c in clause_dicts]
-        vectors = await emb_svc.embed(texts)
-        qdrant_points = _build_qdrant_points(
-            clause_dicts, vectors, contract_id, org_id, now_ts
-        )
-
-        await rag_svc.upsert_clauses(qdrant_points)
-
-        # Step 4 → completed
+        # Step 3 → completed
         await update_ingestion_job(
             pool, job_id, status="completed", progress=100, current_step="완료"
         )

@@ -11,9 +11,9 @@ Processing pipeline:
     2. Load clauses from DB
     3. Parallel analysis (max 5 concurrent):
        a. LLM analysis → risk_level, confidence, issue_types, summary, rationale
-       b. RAG search → topK=3 similar clauses
+       b. RAG search → topK=5 판례/법령 검색 (cases 컬렉션)
        c. Save clause_result to DB (including confidence)
-       d. Save evidence_set to DB
+       d. Save evidence_set to DB (citations: 판례/법령만 포함)
     4. Analysis status completed
     5. On failure → status failed
 
@@ -37,11 +37,8 @@ from openai import APIStatusError
 
 from app.db import (
     get_clauses_for_contract,
-    get_evidence_set_with_clause,
-    get_org_id_for_analysis,
     insert_clause_result,
     insert_evidence_set,
-    update_evidence_set_citations,
     update_risk_analysis,
     update_risk_analysis_summary,
 )
@@ -101,7 +98,6 @@ async def _analyze_single_clause(
     analysis_id: str,
     clause: asyncpg.Record,
     semaphore: asyncio.Semaphore,
-    org_id: str | None = None,
 ) -> ClauseAnalysisResult:
     """Run LLM + RAG for one clause, persist results, and return the LLM result."""
     async with semaphore:
@@ -133,34 +129,13 @@ async def _analyze_single_clause(
             )
             raise
 
-        # RAG: find similar clauses scoped to the same organization.
-        # Passing org_id ensures we only surface evidence from the org's own
-        # historical contracts, preventing cross-tenant data leakage.
-        similar, legal_refs = await asyncio.gather(
-            rag_svc.search_similar_clauses(
-                query_text=clause_text,
-                top_k=3,
-                org_id=org_id,
-            ),
-            rag_svc.search_legal_references(
-                query_text=clause_text,
-                top_k=3,
-            ),
+        # RAG: 판례/법령만 증거로 사용
+        legal_refs = await rag_svc.search_legal_references(
+            query_text=clause_text,
+            top_k=5,
         )
 
-        # Build citations: clause-based + legal references (판례/법령).
         citations = [
-            {
-                "id": s.get("clause_id") or "",
-                "type": "clause",
-                "title": s.get("label") or "유사 조항",
-                "snippet": s.get("payload", {}).get("content", "")[:200],
-                "whyRelevant": "",
-                "source": s.get("contract_id"),
-                "score": s.get("score"),
-            }
-            for s in similar
-        ] + [
             {
                 "id": r.get("source_id") or "",
                 "type": r.get("type", "prec"),
@@ -239,66 +214,6 @@ def _build_recommended_actions(issue_types: list[str]) -> list[str]:
     return [actions_map[it] for it in issue_types if it in actions_map]
 
 
-async def _handle_retrieve_evidence(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
-    """Re-run RAG for an evidence set and update its citations.
-
-    Message format:
-        {
-            "type": "RETRIEVE_EVIDENCE",
-            "evidenceSetId": "<ID>",
-            "orgId": "<org UUID>"   (optional)
-        }
-    """
-    evidence_set_id = msg.get("evidenceSetId")
-    if not evidence_set_id:
-        raise PermanentError("RETRIEVE_EVIDENCE message missing evidenceSetId")
-
-    log.info("RETRIEVE_EVIDENCE started", evidence_set_id=evidence_set_id)
-
-    try:
-        row = await get_evidence_set_with_clause(pool, evidence_set_id)
-    except asyncpg.PostgresConnectionError as exc:
-        raise RetryableError(f"DB error fetching evidence set: {exc}") from exc
-
-    if row is None:
-        raise PermanentError(f"evidence_set not found: {evidence_set_id}")
-
-    clause_text: str = row["clause_content"]
-    org_id: str | None = msg.get("orgId") or row["org_id"]
-    top_k: int = row["top_k"] or 3
-
-    similar = await rag_svc.search_similar_clauses(
-        query_text=clause_text,
-        top_k=top_k,
-        org_id=org_id,
-    )
-
-    citations = [
-        {
-            "id": s.get("clause_id") or "",
-            "type": "clause",
-            "title": s.get("label") or "유사 조항",
-            "snippet": s.get("payload", {}).get("content", "")[:200],
-            "whyRelevant": "",
-            "source": s.get("contract_id"),
-            "score": s.get("score"),
-            "url": f"/contracts/{s.get('contract_id')}/clauses/{s.get('clause_id')}",
-        }
-        for s in similar
-    ]
-
-    try:
-        await update_evidence_set_citations(pool, evidence_set_id, citations)
-    except asyncpg.PostgresConnectionError as exc:
-        raise RetryableError(f"DB error updating citations: {exc}") from exc
-
-    log.info(
-        "RETRIEVE_EVIDENCE completed",
-        evidence_set_id=evidence_set_id,
-        citations_count=len(citations),
-    )
-
-
 async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
     # Validate required fields — raise PermanentError if missing
     try:
@@ -314,10 +229,6 @@ async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
         await update_risk_analysis(pool, analysis_id, status="running")
     except asyncpg.PostgresConnectionError as exc:
         raise RetryableError(f"DB connection error on status update: {exc}") from exc
-
-    # Ensure Qdrant collection exists before running RAG searches.
-    # This handles the case where Qdrant restarts and the collection is gone.
-    await rag_svc.ensure_collection()
 
     # Step 2 — load clauses.
     try:
@@ -337,19 +248,11 @@ async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
 
     log.info("loaded clauses", count=len(clauses))
 
-    # Fetch org_id to scope RAG search to this organization only.
-    org_id = await get_org_id_for_analysis(pool, analysis_id)
-    if org_id is None:
-        log.warning(
-            "org_id not found for analysis — RAG will search across all orgs",
-            analysis_id=analysis_id,
-        )
-
     # Step 3 — parallel analysis with bounded concurrency.
     # Use return_exceptions=True so a single clause failure does not abort others.
     semaphore = asyncio.Semaphore(_MAX_CONCURRENCY)
     tasks = [
-        _analyze_single_clause(pool, analysis_id, clause, semaphore, org_id=org_id)
+        _analyze_single_clause(pool, analysis_id, clause, semaphore)
         for clause in clauses
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -427,36 +330,9 @@ async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
 def make_handler(
     pool: asyncpg.Pool,
 ) -> Callable[[dict[str, Any]], Awaitable[None]]:
-    """Return an async message handler bound to the given DB pool.
-
-    Handles two message types on analysis.jobs:
-      1. Analysis jobs: {"contractId": "...", "analysisId": "..."}
-      2. RETRIEVE_EVIDENCE: {"type": "RETRIEVE_EVIDENCE", "evidenceSetId": "...", "orgId": "..."}
-    """
+    """Return an async message handler bound to the given DB pool."""
 
     async def handler(msg: dict[str, Any]) -> None:
-        # Route by message type.
-        msg_type = msg.get("type")
-        if msg_type == "RETRIEVE_EVIDENCE":
-            evidence_set_id = msg.get("evidenceSetId", "unknown")
-            try:
-                await _handle_retrieve_evidence(pool, msg)
-            except PermanentError as exc:
-                log.error(
-                    "permanent RETRIEVE_EVIDENCE failure",
-                    evidence_set_id=evidence_set_id,
-                    error=str(exc),
-                )
-                raise
-            except (RetryableError, Exception) as exc:
-                log.error(
-                    "retryable RETRIEVE_EVIDENCE failure",
-                    evidence_set_id=evidence_set_id,
-                    error=str(exc),
-                )
-                raise
-            return
-
         analysis_id = msg.get("analysisId", "unknown")
         contract_id = msg.get("contractId", "unknown")
         try:
