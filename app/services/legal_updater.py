@@ -17,7 +17,8 @@ from app.services.rag import CASES_COLLECTION_NAME, _get_client, ensure_cases_co
 log = structlog.get_logger()
 
 _API_BASE = "https://www.law.go.kr/DRF"
-_QUERIES = [
+# 판례 검색 키워드 (전체 텍스트 검색)
+_PREC_QUERIES = [
     "불공정계약",
     "손해배상",
     "계약해지",
@@ -25,6 +26,16 @@ _QUERIES = [
     "위약금",
     "기밀유지",
     "지식재산권",
+]
+# 법령 검색 키워드 (법령명 + 전체 검색, section=all)
+_LAW_QUERIES = [
+    "약관",
+    "손해배상",
+    "계약",
+    "지식재산",
+    "하도급",
+    "공정거래",
+    "개인정보",
 ]
 _DISPLAY = 10
 
@@ -44,7 +55,7 @@ async def _crawl_cases(client: httpx.AsyncClient, oc: str) -> list[dict]:
     seen: set[str] = set()
     docs: list[dict] = []
 
-    for query in _QUERIES:
+    for query in _PREC_QUERIES:
         try:
             data = await _fetch(
                 client,
@@ -103,7 +114,7 @@ async def _crawl_laws(client: httpx.AsyncClient, oc: str) -> list[dict]:
     seen: set[str] = set()
     docs: list[dict] = []
 
-    for query in _QUERIES:
+    for query in _LAW_QUERIES:
         try:
             data = await _fetch(
                 client,
@@ -114,13 +125,16 @@ async def _crawl_laws(client: httpx.AsyncClient, oc: str) -> list[dict]:
                     "type": "JSON",
                     "query": query,
                     "display": _DISPLAY,
+                    "section": "all",
                 },
             )
             items = data.get("LawSearch", {}).get("law", [])
             if isinstance(items, dict):
                 items = [items]
+            elif not isinstance(items, list):
+                items = []
             for item in items:
-                law_id = str(item.get("법령ID", ""))
+                law_id = str(item.get("법령일련번호", ""))
                 if not law_id or law_id in seen:
                     continue
                 seen.add(law_id)
