@@ -378,12 +378,107 @@ async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
     log.info("analysis completed", analysis_id=analysis_id)
 
 
+async def _process_retrieve_evidence(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
+    """Re-run RAG search for an existing evidence_set and update its citations.
+
+    Message format:
+        {
+            "type":          "RETRIEVE_EVIDENCE",
+            "evidenceSetId": "<ULID>",
+            "topK":          5,
+            "filterParams":  ""
+        }
+    """
+    try:
+        evidence_set_id: str = msg["evidenceSetId"]
+    except KeyError as exc:
+        raise PermanentError(f"Missing required message field: {exc}") from exc
+
+    top_k: int = int(msg.get("topK") or 5)
+
+    log.info("retrieve_evidence started", evidence_set_id=evidence_set_id, top_k=top_k)
+
+    try:
+        row = await get_evidence_set_with_clause(pool, evidence_set_id)
+    except asyncpg.PostgresConnectionError as exc:
+        raise RetryableError(
+            f"DB connection error fetching evidence set: {exc}"
+        ) from exc
+
+    if row is None:
+        raise PermanentError(f"evidence_set not found: {evidence_set_id}")
+
+    clause_content: str = row["clause_content"]
+
+    legal_refs = await rag_svc.search_legal_references(
+        query_text=clause_content,
+        top_k=top_k,
+    )
+
+    citations = [
+        {
+            "id": r.get("source_id") or "",
+            "type": r.get("type", "prec"),
+            "title": r.get("title") or ("판례" if r.get("type") == "prec" else "법령"),
+            "snippet": r.get("content", "")[:200],
+            "whyRelevant": _generate_why_relevant(r.get("type", "prec"), []),
+            "source": _law_source_url(r.get("type", "prec"), r.get("source_id", "")),
+            "score": r.get("score"),
+            "date": r.get("date", ""),
+            "court": r.get("court", ""),
+        }
+        for r in legal_refs
+    ]
+
+    try:
+        await update_evidence_set_citations(pool, evidence_set_id, citations)
+    except asyncpg.PostgresConnectionError as exc:
+        raise RetryableError(f"DB connection error updating citations: {exc}") from exc
+
+    log.info(
+        "retrieve_evidence completed",
+        evidence_set_id=evidence_set_id,
+        citation_count=len(citations),
+    )
+
+
 def make_handler(
     pool: asyncpg.Pool,
 ) -> Callable[[dict[str, Any]], Awaitable[None]]:
-    """Return an async message handler bound to the given DB pool."""
+    """Return an async message handler bound to the given DB pool.
+
+    Dispatches on the optional ``type`` field:
+    - ``"RETRIEVE_EVIDENCE"`` → _process_retrieve_evidence
+    - absent / ``"RUN_ANALYSIS"`` (legacy) → _process (contractId + analysisId)
+    - any other value → PermanentError (acked, not retried)
+    """
 
     async def handler(msg: dict[str, Any]) -> None:
+        msg_type = msg.get("type", "RUN_ANALYSIS")
+
+        if msg_type == "RETRIEVE_EVIDENCE":
+            evidence_set_id = msg.get("evidenceSetId", "unknown")
+            try:
+                await _process_retrieve_evidence(pool, msg)
+            except PermanentError as exc:
+                log.error(
+                    "permanent retrieve_evidence failure — acking (no DLQ)",
+                    evidence_set_id=evidence_set_id,
+                    error=str(exc),
+                )
+                raise
+            except (RetryableError, Exception) as exc:
+                log.error(
+                    "retryable retrieve_evidence failure — will retry or DLQ",
+                    evidence_set_id=evidence_set_id,
+                    error=str(exc),
+                )
+                raise
+            return
+
+        if msg_type not in ("RUN_ANALYSIS",):
+            raise PermanentError(f"Unknown message type: {msg_type!r}")
+
         analysis_id = msg.get("analysisId", "unknown")
         contract_id = msg.get("contractId", "unknown")
         try:
