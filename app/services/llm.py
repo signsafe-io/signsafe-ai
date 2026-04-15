@@ -232,11 +232,13 @@ _CLAUSE_BOUNDARY_PROMPT_TEMPLATE = """다음은 계약서에서 추출된 단락
 단락 목록:
 {paragraphs}
 
-다음 JSON 형식으로만 응답하세요:
-[
-  {{"start": <단락 인덱스>, "label": "<조항 제목 또는 null>"}},
-  ...
-]
+다음 JSON 형식으로만 응답하세요 (boundaries 키 아래에 배열로):
+{{
+  "boundaries": [
+    {{"start": <단락 인덱스>, "label": "<조항 제목 또는 null>"}},
+    ...
+  ]
+}}
 
 주의사항:
 - start 인덱스는 0부터 시작합니다
@@ -290,8 +292,11 @@ async def extract_clause_boundaries(
 
         try:
             data = _extract_json(raw_text)
+            # LLM은 {"boundaries": [...]} 형식으로 반환 (json_object 모드 최상위 배열 불가)
+            if isinstance(data, dict):
+                data = data.get("boundaries", [])
             if not isinstance(data, list):
-                raise ValueError("Expected JSON array")
+                raise ValueError("Expected list under 'boundaries' key")
             for item in data:
                 start_idx = int(item.get("start", chunk_start))
                 # 인덱스 범위 검증
