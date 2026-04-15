@@ -204,6 +204,11 @@ def clauses_from_boundaries(
 
     boundaries must be sorted by .start (ascending) and contain no duplicates.
     Each boundary marks the first paragraph of a new clause.
+
+    Short chunks (e.g. header-only lines) are carried forward and merged into
+    the next chunk instead of being dropped, so that a clause header and its
+    body always end up in the same Clause object even if the LLM accidentally
+    placed an extra boundary between them.
     """
     if not boundaries or not paragraphs:
         return []
@@ -215,6 +220,14 @@ def clauses_from_boundaries(
     breakpoints = [(b.start, b.label) for b in boundaries]
     breakpoints.append((len(paragraphs), None))  # sentinel
 
+    # Carry-over state: lines from a too-short previous chunk that must be
+    # prepended to the next chunk rather than discarded.
+    carry_lines: list[str] = []
+    carry_label: str | None = None
+    carry_page_start: int = 1
+    carry_page_end: int = 1
+    carry_anchor: Anchor | None = None
+
     for i, (start_idx, label) in enumerate(breakpoints[:-1]):
         end_idx = breakpoints[i + 1][0]
 
@@ -225,13 +238,38 @@ def clauses_from_boundaries(
         lines = [t for t, _, _ in chunk if t.strip()]
         pages = [p for _, p, _ in chunk]
         first_anchor = next((a for _, _, a in chunk if a is not None), None)
-
         page_start = pages[0] if pages else 1
         page_end = pages[-1] if pages else 1
 
-        # Use LLM-provided label; fall back to first-line extraction.
-        effective_label = label or _extract_label("\n".join(lines)) if lines else None
+        # Merge carry-over from previous too-short chunk.
+        if carry_lines:
+            lines = carry_lines + lines
+            page_start = carry_page_start
+            page_end = max(carry_page_end, page_end)
+            first_anchor = carry_anchor or first_anchor
+            # Carry-over label takes priority (it was the actual clause header).
+            label = carry_label or label
+            carry_lines = []
+            carry_label = None
+            carry_anchor = None
 
+        effective_label = label or (_extract_label("\n".join(lines)) if lines else None)
+        merged = "\n".join(lines).strip()
+
+        if not merged:
+            continue
+
+        if len(merged) < _MIN_CLAUSE_LEN:
+            # Too short on its own — likely a bare header line that the LLM
+            # split from its body. Carry forward to the next iteration.
+            carry_lines = lines
+            carry_label = effective_label
+            carry_page_start = page_start
+            carry_page_end = page_end
+            carry_anchor = first_anchor
+            continue
+
+        # Normal path: write out (splitting oversized clauses if needed).
         char_offset = _flush_lines(
             lines,
             page_start,
@@ -241,6 +279,22 @@ def clauses_from_boundaries(
             char_offset,
             clauses,
         )
+
+    # Flush any remaining carry-over (last segment was a bare header with no body).
+    if carry_lines:
+        merged = "\n".join(carry_lines).strip()
+        if merged:
+            clauses.append(
+                Clause(
+                    text=merged,
+                    label=carry_label,
+                    page_start=carry_page_start,
+                    page_end=carry_page_end,
+                    anchor=carry_anchor,
+                    start_offset=char_offset,
+                    end_offset=char_offset + len(merged),
+                )
+            )
 
     return clauses
 
@@ -304,7 +358,9 @@ def extract_paragraphs_sync(file_path: Path) -> list[RawParagraph]:
     data = file_path.read_bytes()
     suffix = file_path.suffix.lower()
 
-    log.info("extracting paragraphs", path=str(file_path), suffix=suffix, size=len(data))
+    log.info(
+        "extracting paragraphs", path=str(file_path), suffix=suffix, size=len(data)
+    )
 
     if suffix == ".pdf":
         paragraphs = _extract_paragraphs_pdf(data)
