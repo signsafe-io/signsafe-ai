@@ -144,13 +144,13 @@ def _classify_exception(exc: BaseException) -> type[RetryableError | PermanentEr
 _ISSUE_LEGAL_TERMS: dict[str, str] = {
     "LIABILITY_LIMITATION": "손해배상 책임 제한 한도 약관 불공정",
     "TERMINATION_RIGHT": "계약해지 일방적 해지권 해지 요건 통보",
-    "IP_OWNERSHIP": "지식재산권 저작권 특허권 귀속 직무발명 양도",
+    "IP_OWNERSHIP": "저작권 특허권 귀속 직무발명 양도 영업비밀 침해",
     "PENALTY_CLAUSE": "위약금 손해배상예정액 위약벌 과다 감액 불공정",
     "FORCE_MAJEURE": "불가항력 면책 이행불능 천재지변",
     "GOVERNING_LAW": "준거법 관할 국제사법 재판 합의",
     "CONFIDENTIALITY": "영업비밀 비밀유지 경업금지 기밀 누설 금지",
     "INDEMNITY": "면책 손해배상 책임 배상 제한 약관",
-    "PAYMENT_TERMS": "대금지급 지급기한 연체이자 어음 지체상금",
+    "PAYMENT_TERMS": "하도급 대금 지급 연체 지체상금 약관 불공정",
 }
 
 
