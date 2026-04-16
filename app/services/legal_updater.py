@@ -8,6 +8,7 @@ law.go.kr DRF API 주의사항:
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 import xml.etree.ElementTree as ET
 from typing import Any
@@ -26,41 +27,103 @@ log = structlog.get_logger()
 _API_BASE = "https://www.law.go.kr/DRF"
 # 판례 검색 키워드 (전체 텍스트 검색)
 _PREC_QUERIES = [
+    # 계약 일반
     "불공정계약",
-    "손해배상",
-    "계약해지",
-    "약관",
-    "위약금",
-    "기밀유지",
-    "지식재산권",
     "계약위반",
     "계약무효",
+    "계약해제",
+    "계약해지",
+    "불이행",
+    "이행강제",
+    # 손해배상
+    "손해배상",
+    "손해배상예정",
+    "손해배상제한",
+    "손해배상청구",
+    # 약관/불공정
+    "약관",
+    "불공정약관",
+    "부당조항",
     "부당이득",
-    "하도급",
-    "용역계약",
-    "임대차계약",
-    "프리랜서",
-    "근로계약",
+    # 위약금
+    "위약금",
+    "위약벌",
+    "손해배상예정액감액",
+    # 계약 해지권
+    "일방적해지",
+    "해지통보",
+    "해지요건",
+    # 기밀/비밀/경업
+    "기밀유지",
     "비밀유지",
     "경업금지",
-    "손해배상예정",
-    "계약해제",
-    "불이행",
-    # 불가항력/FORCE_MAJEURE
+    "영업비밀",
+    "전직금지",
+    # IP
+    "지식재산권",
+    "저작권양도",
+    "직무발명",
+    "특허귀속",
+    # 하도급/용역
+    "하도급",
+    "용역계약",
+    "도급계약",
+    "용역비",
+    # 근로계약
+    "근로계약",
+    "프리랜서",
+    "근로기준",
+    "임금",
+    # 임대차
+    "임대차계약",
+    "임대차보증금",
+    "전세계약",
+    # 불가항력
     "불가항력",
     "이행불능",
-    # 준거법/GOVERNING_LAW
+    "천재지변",
+    # 준거법/관할
     "관할합의",
     "전속관할",
-    # 지식재산권 귀속
-    "직무발명",
-    "저작권양도",
-    # 대금지급/PAYMENT_TERMS
+    "재판관할",
+    # 대금지급
     "대금지급지연",
     "지체상금",
+    "연체이자",
+    # 면책
+    "면책조항",
+    "면책특약",
+    "책임제한",
+    # 계약갱신
+    "계약갱신",
+    "갱신거절",
+    "계약기간",
+    # 보증/담보
+    "연대보증",
+    "이행보증",
+    "담보책임",
+    # 상사/기업
+    "주식매매",
+    "영업양도",
+    "합병계약",
+    # 소비자
+    "소비자보호",
+    "환불",
+    "청약철회",
+    # 부동산/건설
+    "도급계약위반",
+    "건설계약",
+    "분양계약",
+    # 금융
+    "대출계약",
+    "보험계약",
+    "리스계약",
+    # 정보통신
+    "소프트웨어계약",
+    "IT용역",
+    "데이터계약",
 ]
-# 법령 검색 키워드
-# type=XML 을 사용해야 함 — type=JSON 은 빈 {} 반환
+
 _LAW_QUERIES = [
     "약관규제",
     "하도급거래",
@@ -76,8 +139,18 @@ _LAW_QUERIES = [
     "독점규제",
     "중소기업",
     "소비자보호",
+    "부정경쟁방지",
+    "발명진흥",
+    "가맹사업",
+    "대리점거래",
+    "집합건물",
+    "주택임대차",
+    "상가임대차",
+    "전자금융",
+    "정보통신망",
 ]
-_DISPLAY = 20
+
+_DISPLAY = 100  # 키워드당 최대 100개 (API 허용 최대치)
 
 
 def _to_uuid(source_id: str, ref_type: str) -> str:
@@ -188,8 +261,47 @@ def _extract_law_content(root: ET.Element, law_id: str) -> tuple[str, str]:
     return law_name, "\n\n".join(content_parts)[:3000]
 
 
+
+
+_DETAIL_CONCURRENCY = 10  # law.go.kr 상세 조회 동시 요청 수
+
+
+async def _fetch_prec_detail(
+    client: httpx.AsyncClient,
+    oc: str,
+    seq: str,
+    sem: "asyncio.Semaphore",
+) -> dict | None:
+    """Fetch a single 판례 detail with concurrency control."""
+    async with sem:
+        try:
+            detail_root = await _fetch_xml(
+                client,
+                "lawService.do",
+                {"OC": oc, "target": "prec", "ID": seq},
+            )
+            d = detail_root if detail_root.tag == "PrecService" else detail_root
+            raw_content = _xml_text(d, "판례내용") or _xml_text(d, "전문")
+            content = BeautifulSoup(raw_content, "html.parser").get_text()[:3000]
+            if not content.strip():
+                return None
+            return {
+                "type": "prec",
+                "source_id": seq,
+                "title": _xml_text(d, "사건명"),
+                "content": content,
+                "date": _xml_text(d, "선고일자"),
+                "court": _xml_text(d, "법원명"),
+            }
+        except Exception as exc:
+            log.warning("판례 상세 조회 실패", seq=seq, error=str(exc))
+            return None
+
+
 async def _crawl_cases(client: httpx.AsyncClient, oc: str) -> list[dict]:
     seen: set[str] = set()
+    # 키워드별 검색은 순차 실행, 상세 조회는 키워드 내에서 병렬 실행
+    sem = asyncio.Semaphore(_DETAIL_CONCURRENCY)
     docs: list[dict] = []
 
     for query in _PREC_QUERIES:
@@ -197,12 +309,7 @@ async def _crawl_cases(client: httpx.AsyncClient, oc: str) -> list[dict]:
             root = await _fetch_xml(
                 client,
                 "lawSearch.do",
-                {
-                    "OC": oc,
-                    "target": "prec",
-                    "query": query,
-                    "display": _DISPLAY,
-                },
+                {"OC": oc, "target": "prec", "query": query, "display": _DISPLAY},
             )
             items = root.findall("prec")
             log.debug(
@@ -211,45 +318,67 @@ async def _crawl_cases(client: httpx.AsyncClient, oc: str) -> list[dict]:
                 total_cnt=_xml_text(root, "totalCnt"),
                 item_count=len(items),
             )
+            # 이미 수집한 판례 제외 후 상세 병렬 조회
+            new_seqs = []
             for item in items:
                 seq = _xml_text(item, "판례일련번호")
-                if not seq or seq in seen:
-                    continue
-                seen.add(seq)
-                try:
-                    detail_root = await _fetch_xml(
-                        client,
-                        "lawService.do",
-                        {
-                            "OC": oc,
-                            "target": "prec",
-                            "ID": seq,
-                        },
-                    )
-                    # 판례 상세: <PrecService> 루트 또는 직접 자식 요소
-                    d = detail_root if detail_root.tag == "PrecService" else detail_root
-                    raw_content = _xml_text(d, "판례내용") or _xml_text(d, "전문")
-                    content = BeautifulSoup(raw_content, "html.parser").get_text()[
-                        :3000
-                    ]
-                    if not content.strip():
-                        continue
-                    docs.append(
-                        {
-                            "type": "prec",
-                            "source_id": seq,
-                            "title": _xml_text(d, "사건명"),
-                            "content": content,
-                            "date": _xml_text(d, "선고일자"),
-                            "court": _xml_text(d, "법원명"),
-                        }
-                    )
-                except Exception as exc:
-                    log.warning("판례 상세 조회 실패", seq=seq, error=str(exc))
+                if seq and seq not in seen:
+                    seen.add(seq)
+                    new_seqs.append(seq)
+
+            if new_seqs:
+                results = await asyncio.gather(
+                    *[_fetch_prec_detail(client, oc, seq, sem) for seq in new_seqs]
+                )
+                docs.extend(r for r in results if r is not None)
+                log.info(
+                    "판례 키워드 완료",
+                    query=query,
+                    fetched=len(new_seqs),
+                    added=sum(1 for r in results if r is not None),
+                    total_so_far=len(docs),
+                )
         except Exception as exc:
             log.warning("판례 검색 실패", query=query, error=str(exc))
 
     return docs
+
+
+async def _fetch_law_detail(
+    client: httpx.AsyncClient,
+    oc: str,
+    law_id: str,
+    law_name_from_search: str,
+    pub_date_from_search: str,
+    sem: "asyncio.Semaphore",
+) -> dict | None:
+    """Fetch a single 법령 detail with concurrency control."""
+    async with sem:
+        try:
+            detail_root = await _fetch_xml(
+                client,
+                "lawService.do",
+                {"OC": oc, "target": "law", "MST": law_id},
+            )
+            law_name, content = _extract_law_content(detail_root, law_id)
+            law_name = law_name or law_name_from_search
+            if not content.strip():
+                if not law_name:
+                    return None
+                content = law_name
+            basic = detail_root.find("기본정보")
+            pub_date = _xml_text(basic, "공포일자") or pub_date_from_search
+            return {
+                "type": "law",
+                "source_id": law_id,
+                "title": law_name,
+                "content": content,
+                "date": pub_date,
+                "court": "",
+            }
+        except Exception as exc:
+            log.warning("법령 상세 조회 실패", law_id=law_id, error=str(exc))
+            return None
 
 
 async def _crawl_laws(client: httpx.AsyncClient, oc: str) -> list[dict]:
@@ -260,6 +389,7 @@ async def _crawl_laws(client: httpx.AsyncClient, oc: str) -> list[dict]:
       - ID 파라미터는 동작하지 않음 — MST(법령일련번호)를 사용해야 함
     """
     seen: set[str] = set()
+    sem = asyncio.Semaphore(_DETAIL_CONCURRENCY)
     docs: list[dict] = []
 
     for query in _LAW_QUERIES:
@@ -282,56 +412,34 @@ async def _crawl_laws(client: httpx.AsyncClient, oc: str) -> list[dict]:
                 total_cnt=total_cnt,
                 item_count=len(items),
             )
+            new_items = []
             for item in items:
-                # 법령일련번호 = MST 값으로 상세 조회에 사용
                 law_id = _xml_text(item, "법령일련번호")
-                law_name_from_search = _xml_text(item, "법령명한글")
-                pub_date_from_search = _xml_text(item, "공포일자")
-                if not law_id or law_id in seen:
-                    continue
-                seen.add(law_id)
-                try:
-                    # 법령 상세 조회: MST=법령일련번호 (ID 파라미터 동작 안함)
-                    detail_root = await _fetch_xml(
-                        client,
-                        "lawService.do",
-                        {
-                            "OC": oc,
-                            "target": "law",
-                            "MST": law_id,
-                        },
-                    )
-                    law_name, content = _extract_law_content(detail_root, law_id)
-                    law_name = law_name or law_name_from_search
-
-                    if not content.strip():
-                        # 조문이 없을 경우 법령명이라도 저장하여 Qdrant 인덱싱 유지
-                        if not law_name:
-                            log.debug("법령 조문 없음, 건너뜀", law_id=law_id)
-                            continue
-                        log.debug(
-                            "법령 조문 없음 — 법령명으로 폴백",
-                            law_id=law_id,
-                            law_name=law_name,
+                if law_id and law_id not in seen:
+                    seen.add(law_id)
+                    new_items.append(
+                        (
+                            law_id,
+                            _xml_text(item, "법령명한글"),
+                            _xml_text(item, "공포일자"),
                         )
-                        content = law_name
-
-                    # 공포일자: 상세에서 못 얻으면 검색 결과 값 사용
-                    basic = detail_root.find("기본정보")
-                    pub_date = _xml_text(basic, "공포일자") or pub_date_from_search
-
-                    docs.append(
-                        {
-                            "type": "law",
-                            "source_id": law_id,
-                            "title": law_name,
-                            "content": content,
-                            "date": pub_date,
-                            "court": "",
-                        }
                     )
-                except Exception as exc:
-                    log.warning("법령 상세 조회 실패", law_id=law_id, error=str(exc))
+
+            if new_items:
+                results = await asyncio.gather(
+                    *[
+                        _fetch_law_detail(client, oc, lid, lname, pdate, sem)
+                        for lid, lname, pdate in new_items
+                    ]
+                )
+                docs.extend(r for r in results if r is not None)
+                log.info(
+                    "법령 키워드 완료",
+                    query=query,
+                    fetched=len(new_items),
+                    added=sum(1 for r in results if r is not None),
+                    total_so_far=len(docs),
+                )
         except Exception as exc:
             log.warning("법령 검색 실패", query=query, error=str(exc))
 
