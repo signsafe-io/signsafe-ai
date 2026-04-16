@@ -261,8 +261,6 @@ def _extract_law_content(root: ET.Element, law_id: str) -> tuple[str, str]:
     return law_name, "\n\n".join(content_parts)[:3000]
 
 
-
-
 _DETAIL_CONCURRENCY = 10  # law.go.kr 상세 조회 동시 요청 수
 
 
@@ -446,8 +444,38 @@ async def _crawl_laws(client: httpx.AsyncClient, oc: str) -> list[dict]:
     return docs
 
 
+_UPSERT_BATCH_SIZE = 200  # embed + upsert 단위 — peak 메모리 제한용
+
+
+async def _upsert_batch(qdrant: Any, docs: list[dict]) -> int:
+    """Embed and upsert a batch of docs. Returns number of points upserted."""
+    texts = [f"{d['title']}\n{d['content']}" for d in docs]
+    vectors = await embed(texts)
+    points = [
+        PointStruct(
+            id=_to_uuid(d["source_id"], d["type"]),
+            vector=v,
+            payload={
+                "type": d["type"],
+                "source_id": d["source_id"],
+                "title": d["title"],
+                "content": d["content"][:1000],
+                "date": d.get("date", ""),
+                "court": d.get("court", ""),
+            },
+        )
+        for d, v in zip(docs, vectors)
+    ]
+    await qdrant.upsert(collection_name=CASES_COLLECTION_NAME, points=points)
+    return len(points)
+
+
 async def run_update() -> None:
-    """Crawl 판례 + 법령 and upsert into Qdrant cases collection."""
+    """Crawl 판례 + 법령 and upsert into Qdrant cases collection.
+
+    Processes documents in batches of _UPSERT_BATCH_SIZE to cap peak memory usage.
+    Each batch is embedded and upserted before the next batch is processed.
+    """
     oc = settings.law_api_oc
     if not oc:
         log.warning("LAW_API_OC not configured — skipping legal data update")
@@ -469,25 +497,17 @@ async def run_update() -> None:
         log.warning("no legal documents crawled — nothing to upsert")
         return
 
-    texts = [f"{d['title']}\n{d['content']}" for d in all_docs]
-    vectors = await embed(texts)
-
     qdrant = _get_client()
-    points = [
-        PointStruct(
-            id=_to_uuid(d["source_id"], d["type"]),
-            vector=v,
-            payload={
-                "type": d["type"],
-                "source_id": d["source_id"],
-                "title": d["title"],
-                "content": d["content"][:1000],
-                "date": d.get("date", ""),
-                "court": d.get("court", ""),
-            },
+    total_upserted = 0
+    for i in range(0, len(all_docs), _UPSERT_BATCH_SIZE):
+        batch = all_docs[i : i + _UPSERT_BATCH_SIZE]
+        n = await _upsert_batch(qdrant, batch)
+        total_upserted += n
+        log.info(
+            "legal data batch upserted",
+            batch_start=i,
+            batch_size=n,
+            total_upserted=total_upserted,
         )
-        for d, v in zip(all_docs, vectors)
-    ]
 
-    await qdrant.upsert(collection_name=CASES_COLLECTION_NAME, points=points)
-    log.info("legal data upserted", count=len(points))
+    log.info("legal data upserted", count=total_upserted)
