@@ -77,6 +77,38 @@ _MAX_CLAUSE_LEN = 3000
 RawParagraph = tuple[str, int, Anchor | None]
 
 
+def _sub_split_block(
+    text: str, page_num: int, anchor: Anchor | None
+) -> list[RawParagraph]:
+    """PyMuPDF 블록 내에 여러 조항 헤더가 포함된 경우 서브스플릿.
+
+    get_text("blocks") 는 레이아웃 블록 단위라 "제1조\n...\n제2조\n..." 같이
+    여러 조항이 하나의 블록으로 묶이는 경우가 있다. 이 경우 LLM/정규식 모두
+    첫 번째 헤더만 인식하므로, 헤더 패턴이 등장하는 줄마다 새 단락을 시작한다.
+    """
+    lines = text.split("\n")
+    result: list[RawParagraph] = []
+    current: list[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if _KO_HEADER.match(stripped) and current:
+            # 헤더 등장 → 직전 단락 flush 후 새 단락 시작
+            combined = "\n".join(current).strip()
+            if combined:
+                result.append((combined, page_num, anchor))
+            current = [line]
+        else:
+            current.append(line)
+
+    if current:
+        combined = "\n".join(current).strip()
+        if combined:
+            result.append((combined, page_num, anchor))
+
+    return result if result else [(text, page_num, anchor)]
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -329,7 +361,8 @@ def _extract_paragraphs_pdf(data: bytes) -> list[RawParagraph]:
                 width=float(x1 - x0) / page_width,
                 height=float(y1 - y0) / page_height,
             )
-            paragraphs.append((text, page_num, anchor))
+            # 하나의 블록에 여러 조항 헤더가 포함될 수 있으므로 서브스플릿.
+            paragraphs.extend(_sub_split_block(text, page_num, anchor))
 
     doc.close()
     return paragraphs
