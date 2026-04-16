@@ -81,11 +81,15 @@ async def main() -> None:
     queue_conn = await connect_queue()
 
     # Import workers here to avoid circular imports at module level.
+    from app.workers.analysis import make_dlq_handler as make_analysis_dlq_handler
     from app.workers.analysis import make_handler as make_analysis_handler
+    from app.workers.ingestion import make_dlq_handler as make_ingestion_dlq_handler
     from app.workers.ingestion import make_handler as make_ingestion_handler
 
     ingestion_handler = make_ingestion_handler(db)
     analysis_handler = make_analysis_handler(db)
+    ingestion_dlq_handler = make_ingestion_dlq_handler(db)
+    analysis_dlq_handler = make_analysis_dlq_handler(db)
 
     log.info("connections established, starting workers")
 
@@ -112,8 +116,8 @@ async def main() -> None:
         asyncio.gather(
             consume(queue_conn, INGESTION_QUEUE, ingestion_handler),
             consume(queue_conn, ANALYSIS_QUEUE, analysis_handler),
-            consume_dlq(queue_conn, INGESTION_DLQ),
-            consume_dlq(queue_conn, ANALYSIS_DLQ),
+            consume_dlq(queue_conn, INGESTION_DLQ, ingestion_dlq_handler),
+            consume_dlq(queue_conn, ANALYSIS_DLQ, analysis_dlq_handler),
             _run_weekly_legal_update(),
         )
     )

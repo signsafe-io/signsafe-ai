@@ -37,6 +37,7 @@ from typing import Any
 import asyncpg
 import boto3
 import structlog
+from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
 from app.config import settings
@@ -59,6 +60,7 @@ def _make_s3_client() -> Any:
         aws_access_key_id=settings.s3_access_key,
         aws_secret_access_key=settings.s3_secret_key,
         region_name="us-east-1",
+        config=Config(connect_timeout=10, read_timeout=120),
     )
 
 
@@ -277,3 +279,42 @@ def make_handler(
             raise  # re-raise; queue.consume retries or nacks → DLQ
 
     return handler
+
+
+def make_dlq_handler(
+    pool: asyncpg.Pool,
+) -> Callable[[dict[str, Any]], Awaitable[None]]:
+    """Return a DLQ callback that marks the ingestion job as failed in the DB.
+
+    Called by consume_dlq for every message that could not be processed after
+    all retries.  Idempotent: a job that is already 'failed' stays 'failed'.
+    """
+
+    async def on_dlq_message(msg: dict[str, Any]) -> None:
+        job_id = msg.get("jobId")
+        contract_id = msg.get("contractId")
+        if not job_id:
+            log.warning("ingestion DLQ message missing jobId", msg=str(msg)[:200])
+            return
+        try:
+            await update_ingestion_job(
+                pool,
+                job_id,
+                status="failed",
+                progress=0,
+                error_message="DLQ: 최대 재시도 횟수 초과",
+            )
+            if contract_id:
+                await update_contract_status(pool, contract_id, "failed")
+            log.info(
+                "ingestion DLQ: job marked failed",
+                job_id=job_id,
+                contract_id=contract_id,
+            )
+        except Exception:
+            log.exception(
+                "ingestion DLQ: failed to update job status",
+                job_id=job_id,
+            )
+
+    return on_dlq_message

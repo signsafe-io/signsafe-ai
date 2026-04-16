@@ -59,11 +59,17 @@ async def _declare_queue_with_dlq(
 async def consume_dlq(
     connection: aio_pika.abc.AbstractRobustConnection,
     dlq_name: str,
+    on_dlq_message: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> None:
     """Consume messages from a DLQ and log each one as an error.
 
     DLQ messages represent processing failures. This consumer ensures they are
     never silently accumulated — every entry is logged so operators can triage.
+
+    If ``on_dlq_message`` is provided it is called with the parsed message body
+    so the caller can update persistent state (e.g. mark the job as failed in
+    the DB).  Errors from the callback are logged but do NOT prevent the message
+    from being acked.
     """
     channel = await connection.channel()
     await channel.set_qos(prefetch_count=1)
@@ -86,6 +92,15 @@ async def consume_dlq(
                         headers=headers,
                         message_id=message.message_id,
                     )
+                    if on_dlq_message is not None:
+                        try:
+                            body = json.loads(body_str)
+                            await on_dlq_message(body)
+                        except Exception:
+                            log.exception(
+                                "DLQ on_dlq_message callback failed",
+                                queue=dlq_name,
+                            )
                 except Exception:
                     log.exception("failed to log DLQ message", queue=dlq_name)
 
