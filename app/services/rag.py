@@ -46,6 +46,9 @@ async def ensure_cases_collection() -> None:
         log.info("qdrant collection exists", collection=CASES_COLLECTION_NAME)
 
 
+_MIN_SCORE = 0.42  # 코사인 유사도 최소값 — 이 미만은 무관한 문서로 간주하고 제외
+
+
 async def search_legal_references(
     query_text: str,
     top_k: int = 3,
@@ -54,9 +57,12 @@ async def search_legal_references(
     """Search Qdrant cases collection for relevant 판례/법령.
 
     Args:
-        query_text: focused search query (LLM issue labels + summary recommended).
-        top_k: number of results to return.
+        query_text: focused search query — use legal terminology, not clause text.
+        top_k: number of results to return (before score filtering).
         ref_type: optional filter — "prec" for 판례, "law" for 법령, None for both.
+
+    Returns only results with cosine similarity >= _MIN_SCORE to avoid returning
+    irrelevant documents when no good match exists.
     """
     client = _get_client()
 
@@ -73,15 +79,17 @@ async def search_legal_references(
         must.append(FieldCondition(key="type", match=MatchValue(value=ref_type)))
     query_filter = Filter(must=must) if must else None
 
+    # score_threshold를 Qdrant에 직접 전달해 네트워크 오버헤드도 줄임
     response = await client.query_points(
         collection_name=CASES_COLLECTION_NAME,
         query=query_vector,
         limit=top_k,
         query_filter=query_filter,
         with_payload=True,
+        score_threshold=_MIN_SCORE,
     )
 
-    return [
+    results = [
         {
             "type": r.payload.get("type", "prec"),
             "source_id": r.payload.get("source_id", ""),
@@ -93,3 +101,11 @@ async def search_legal_references(
         }
         for r in response.points
     ]
+
+    log.info(
+        "rag search complete",
+        query_preview=query_text[:80],
+        returned=len(results),
+        top_score=results[0]["score"] if results else None,
+    )
+    return results

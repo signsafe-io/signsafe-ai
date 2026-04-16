@@ -140,19 +140,34 @@ def _classify_exception(exc: BaseException) -> type[RetryableError | PermanentEr
     return RetryableError
 
 
+# issue_type → 판례/법령에 실제로 등장하는 법률 용어 (임베딩 유사도 극대화)
+_ISSUE_LEGAL_TERMS: dict[str, str] = {
+    "LIABILITY_LIMITATION": "손해배상 책임 제한 한도 약관 불공정",
+    "TERMINATION_RIGHT": "계약해지 일방적 해지권 해지 요건 통보",
+    "IP_OWNERSHIP": "지식재산권 저작권 특허권 귀속 직무발명 양도",
+    "PENALTY_CLAUSE": "위약금 손해배상예정액 위약벌 과다 감액 불공정",
+    "FORCE_MAJEURE": "불가항력 면책 이행불능 천재지변",
+    "GOVERNING_LAW": "준거법 관할 국제사법 재판 합의",
+    "CONFIDENTIALITY": "영업비밀 비밀유지 경업금지 기밀 누설 금지",
+    "INDEMNITY": "면책 손해배상 책임 배상 제한 약관",
+    "PAYMENT_TERMS": "대금지급 지급기한 연체이자 어음 지체상금",
+}
+
+
 def _build_rag_query(llm_result: ClauseAnalysisResult) -> str:
     """Build a focused RAG search query from LLM analysis results.
 
-    Using the full clause text (up to 3000 chars) as a query dilutes the
-    embedding with irrelevant boilerplate.  The LLM has already extracted
-    the legally-relevant issues; search those directly for much better recall.
+    Uses issue_type → legal terminology mapping rather than the LLM summary
+    text, because actual 판례/법령 use specific legal vocabulary (e.g.
+    '손해배상예정액 감액', '경업금지 약정 유효성') that does not appear in
+    plain-language summaries.  Mixing the summary adds noise and degrades
+    cosine similarity scores.
     """
     parts: list[str] = []
-    if llm_result.issue_types:
-        labels = [_ISSUE_LABELS.get(it, it) for it in llm_result.issue_types]
-        parts.append(" ".join(labels))
-    if llm_result.summary:
-        parts.append(llm_result.summary)
+    for it in llm_result.issue_types:
+        legal_terms = _ISSUE_LEGAL_TERMS.get(it)
+        if legal_terms:
+            parts.append(legal_terms)
     return " ".join(parts) if parts else "계약 조항"
 
 
