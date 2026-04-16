@@ -79,7 +79,9 @@ async def search_legal_references(
         must.append(FieldCondition(key="type", match=MatchValue(value=ref_type)))
     query_filter = Filter(must=must) if must else None
 
-    # score_threshold를 Qdrant에 직접 전달해 네트워크 오버헤드도 줄임
+    # score_threshold를 서버에 전달하되, 클라이언트에서도 재검증한다.
+    # Qdrant 서버 버전에 따라 query_points()의 score_threshold 파라미터가
+    # 무시되는 경우가 있어 클라이언트 측 필터링을 안전망으로 추가한다.
     response = await client.query_points(
         collection_name=CASES_COLLECTION_NAME,
         query=query_vector,
@@ -100,6 +102,7 @@ async def search_legal_references(
             "score": r.score,
         }
         for r in response.points
+        if r.score >= _MIN_SCORE  # client-side safety net
     ]
 
     log.info(
