@@ -66,7 +66,9 @@ _KO_HEADER = re.compile(
     re.IGNORECASE,
 )
 
-_MIN_CLAUSE_LEN = 30
+# 최소 길이는 페이지 번호·공백 같은 노이즈만 걸러낼 수 있을 만큼 낮게 유지한다.
+# 30자로 설정하면 짧은 정상 조항(예: "제1조\n계약 당사자는 갑·을이다.")도 드롭됨.
+_MIN_CLAUSE_LEN = 5
 _MAX_CLAUSE_LEN = 3000
 
 # ---------------------------------------------------------------------------
@@ -132,7 +134,12 @@ def _flush_lines(
 ) -> int:
     """Merge lines into Clause(s), appending to out. Returns updated char_offset."""
     merged = "\n".join(lines).strip()
-    if len(merged) < _MIN_CLAUSE_LEN:
+    # 헤더 패턴으로 시작하는 조항은 길이 무관하게 보존한다.
+    # 짧아도 정상 조항(예: "제4조\n기간: 미정")이 누락되는 것을 방지.
+    has_header = (
+        bool(_KO_HEADER.match(merged.split("\n")[0].strip())) if merged else False
+    )
+    if len(merged) < _MIN_CLAUSE_LEN and not has_header:
         return char_offset
 
     if len(merged) > _MAX_CLAUSE_LEN:
