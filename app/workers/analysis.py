@@ -140,37 +140,6 @@ def _classify_exception(exc: BaseException) -> type[RetryableError | PermanentEr
     return RetryableError
 
 
-# issue_type → 판례/법령에 실제로 등장하는 법률 용어 (임베딩 유사도 극대화)
-_ISSUE_LEGAL_TERMS: dict[str, str] = {
-    "LIABILITY_LIMITATION": "손해배상 책임 제한 한도 약관 불공정",
-    "TERMINATION_RIGHT": "계약해지 일방적 해지권 해지 요건 통보",
-    "IP_OWNERSHIP": "저작권 특허권 귀속 직무발명 양도 영업비밀 침해",
-    "PENALTY_CLAUSE": "위약금 손해배상예정액 위약벌 과다 감액 불공정",
-    "FORCE_MAJEURE": "불가항력 면책 이행불능 천재지변",
-    "GOVERNING_LAW": "준거법 관할 국제사법 재판 합의",
-    "CONFIDENTIALITY": "영업비밀 비밀유지 경업금지 기밀 누설 금지",
-    "INDEMNITY": "면책 손해배상 책임 배상 제한 약관",
-    "PAYMENT_TERMS": "하도급 대금 지급 연체 지체상금 약관 불공정",
-}
-
-
-def _build_rag_query(llm_result: ClauseAnalysisResult) -> str:
-    """Build a focused RAG search query from LLM analysis results.
-
-    Uses issue_type → legal terminology mapping rather than the LLM summary
-    text, because actual 판례/법령 use specific legal vocabulary (e.g.
-    '손해배상예정액 감액', '경업금지 약정 유효성') that does not appear in
-    plain-language summaries.  Mixing the summary adds noise and degrades
-    cosine similarity scores.
-    """
-    parts: list[str] = []
-    for it in llm_result.issue_types:
-        legal_terms = _ISSUE_LEGAL_TERMS.get(it)
-        if legal_terms:
-            parts.append(legal_terms)
-    return " ".join(parts) if parts else "계약 조항"
-
-
 async def _analyze_single_clause(
     pool: asyncpg.Pool,
     analysis_id: str,
@@ -190,13 +159,28 @@ async def _analyze_single_clause(
 
         log.info("analyzing clause", clause_id=clause_id, label=label)
 
-        # LLM analysis with per-clause total timeout.
+        # Step 1: RAG 먼저 — 조항 앞부분(헤더+첫 문장)으로 관련 판례/법령 검색.
+        # 전체 조항 텍스트 대신 앞 300자를 사용해 핵심 주제가 임베딩에 집중되도록 함.
+        # 검색 결과는 LLM 프롬프트에 주입되어 AI가 실제 판례 근거로 분석하게 함.
+        rag_query_text = clause_text[:300]
+        legal_refs = await rag_svc.search_legal_references(
+            query_text=rag_query_text,
+            top_k=5,
+        )
+        log.info(
+            "rag pre-fetch complete",
+            clause_id=clause_id,
+            refs_found=len(legal_refs),
+        )
+
+        # Step 2: LLM 분석 — RAG 결과를 컨텍스트로 주입.
         # analyze_clause() already applies a 60 s call-level timeout; this outer
-        # guard covers the full pipeline (LLM + RAG + DB) to prevent a semaphore
+        # guard covers the full pipeline (RAG + LLM + DB) to prevent a semaphore
         # slot from being occupied indefinitely.
         try:
             llm_result = await asyncio.wait_for(
-                analyze_clause(clause_text), timeout=_CLAUSE_TIMEOUT
+                analyze_clause(clause_text, legal_refs=legal_refs),
+                timeout=_CLAUSE_TIMEOUT,
             )
         except TimeoutError:
             log.error(
@@ -206,15 +190,6 @@ async def _analyze_single_clause(
                 timeout=_CLAUSE_TIMEOUT,
             )
             raise
-
-        # RAG: LLM 분석 결과(issue_types + summary)를 검색 쿼리로 사용.
-        # 조항 원문 전체를 임베딩하면 법적 핵심이 희석되므로,
-        # LLM이 추출한 이슈 키워드 + 요약을 쿼리로 사용해 정확도를 높인다.
-        rag_query = _build_rag_query(llm_result)
-        legal_refs = await rag_svc.search_legal_references(
-            query_text=rag_query,
-            top_k=5,
-        )
 
         citations = [
             {

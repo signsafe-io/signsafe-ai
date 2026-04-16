@@ -46,14 +46,14 @@ def _is_retryable(exc: BaseException) -> bool:
 _ANALYSIS_PROMPT_TEMPLATE = """계약서 조항을 분석하여 리스크를 평가해주세요.
 
 조항: {clause_text}
-
+{legal_context_section}
 다음 JSON 형식으로만 응답하세요:
 {{
   "risk_level": "HIGH|MEDIUM|LOW",
   "confidence": 0.85,
   "issue_types": ["LIABILITY_LIMITATION", ...],
   "summary": "한국어 리스크 요약 (2-3문장)",
-  "rationale": "판단 근거 상세 설명"
+  "rationale": "판단 근거 상세 설명 — 관련 판례/법령이 제공된 경우 이를 구체적으로 인용할 것"
 }}
 
 confidence 필드 설명:
@@ -71,6 +71,26 @@ confidence 필드 설명:
 - CONFIDENTIALITY: 기밀유지
 - INDEMNITY: 면책 조항
 - PAYMENT_TERMS: 지급 조건"""
+
+
+def _build_legal_context_section(legal_refs: list[dict]) -> str:
+    """Format retrieved 판례/법령 as a prompt section for the LLM."""
+    if not legal_refs:
+        return ""
+    lines = ["\n관련 판례/법령 (분석 시 참고하여 rationale에 인용):"]
+    for i, ref in enumerate(legal_refs[:3], 1):  # 최대 3개만 주입
+        ref_type = "판례" if ref.get("type") == "prec" else "법령"
+        title = ref.get("title", "")
+        content = ref.get("content", "")[:300].replace("\n", " ")
+        date = ref.get("date", "")
+        court = ref.get("court", "")
+        meta = f"{court} {date}".strip() if (court or date) else ""
+        lines.append(
+            f"[{i}] [{ref_type}] {title}"
+            + (f" ({meta})" if meta else "")
+            + f"\n    {content}"
+        )
+    return "\n".join(lines) + "\n"
 
 
 @dataclass
@@ -389,10 +409,24 @@ async def extract_clause_boundaries(
     return unique
 
 
-async def analyze_clause(clause_text: str) -> ClauseAnalysisResult:
-    """Run LLM risk analysis on a single clause and return structured result."""
+async def analyze_clause(
+    clause_text: str,
+    legal_refs: list[dict] | None = None,
+) -> ClauseAnalysisResult:
+    """Run LLM risk analysis on a single clause and return structured result.
+
+    Args:
+        clause_text: the raw clause to analyze.
+        legal_refs: optional list of retrieved 판례/법령 from RAG search.
+            When provided, injected into the prompt so the LLM can cite them
+            in the rationale instead of reasoning from scratch.
+    """
     client = _get_client()
-    prompt = _ANALYSIS_PROMPT_TEMPLATE.format(clause_text=clause_text)
+    legal_context_section = _build_legal_context_section(legal_refs or [])
+    prompt = _ANALYSIS_PROMPT_TEMPLATE.format(
+        clause_text=clause_text,
+        legal_context_section=legal_context_section,
+    )
 
     try:
         raw_text = await _call_llm(client, prompt)
