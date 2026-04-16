@@ -50,16 +50,13 @@ async def search_legal_references(
     query_text: str,
     top_k: int = 3,
     ref_type: str | None = None,
-    query_vector: list[float] | None = None,
 ) -> list[dict[str, Any]]:
     """Search Qdrant cases collection for relevant 판례/법령.
 
     Args:
-        query_text: clause text to search against.
+        query_text: focused search query (LLM issue labels + summary recommended).
         top_k: number of results to return.
         ref_type: optional filter — "prec" for 판례, "law" for 법령, None for both.
-        query_vector: pre-computed embedding vector. When provided, the embed()
-            call is skipped, saving one API round-trip.
     """
     client = _get_client()
 
@@ -68,9 +65,8 @@ async def search_legal_references(
     if CASES_COLLECTION_NAME not in existing:
         return []
 
-    if query_vector is None:
-        vectors = await embed([query_text])
-        query_vector = vectors[0]
+    vectors = await embed([query_text])
+    query_vector = vectors[0]
 
     must: list[Any] = []
     if ref_type:
