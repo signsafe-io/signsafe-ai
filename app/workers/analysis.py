@@ -44,6 +44,7 @@ from app.db import (
 )
 from app.errors import PermanentError, RetryableError
 from app.services import rag as rag_svc
+from app.services.embeddings import embed
 from app.services.llm import (
     MODEL,
     ClauseAnalysisResult,
@@ -145,8 +146,13 @@ async def _analyze_single_clause(
     analysis_id: str,
     clause: asyncpg.Record,
     semaphore: asyncio.Semaphore,
+    clause_vector: list[float] | None = None,
 ) -> ClauseAnalysisResult:
-    """Run LLM + RAG for one clause, persist results, and return the LLM result."""
+    """Run LLM + RAG for one clause, persist results, and return the LLM result.
+
+    clause_vector: pre-computed embedding for this clause.  When provided, the
+        RAG step skips the embed() call, saving one API round-trip per clause.
+    """
     async with semaphore:
         clause_id: str = clause["id"]
         clause_text: str = clause["content"]
@@ -176,10 +182,12 @@ async def _analyze_single_clause(
             )
             raise
 
-        # RAG: 판례/법령만 증거로 사용
+        # RAG: 판례/법령만 증거로 사용.
+        # Pass pre-computed vector to skip the per-clause embed() round-trip.
         legal_refs = await rag_svc.search_legal_references(
             query_text=clause_text,
             top_k=5,
+            query_vector=clause_vector,
         )
 
         citations = [
@@ -299,12 +307,26 @@ async def _process(pool: asyncpg.Pool, msg: dict[str, Any]) -> None:
 
     log.info("loaded clauses", count=len(clauses))
 
+    # Pre-batch embed all clause texts in a single API call.
+    # Each clause would otherwise embed individually inside search_legal_references,
+    # resulting in N serial round-trips.  One batch call reduces this to O(1).
+    clause_texts = [c["content"] for c in clauses]
+    try:
+        clause_vectors: list[list[float] | None] = await embed(clause_texts)
+        log.info("batch embedding complete", clause_count=len(clause_vectors))
+    except Exception as exc:
+        log.warning(
+            "batch embedding failed — RAG will embed per-clause",
+            error=str(exc),
+        )
+        clause_vectors = [None] * len(clauses)
+
     # Step 3 — parallel analysis with bounded concurrency.
     # Use return_exceptions=True so a single clause failure does not abort others.
     semaphore = asyncio.Semaphore(_MAX_CONCURRENCY)
     tasks = [
-        _analyze_single_clause(pool, analysis_id, clause, semaphore)
-        for clause in clauses
+        _analyze_single_clause(pool, analysis_id, clause, semaphore, vec)
+        for clause, vec in zip(clauses, clause_vectors)
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 

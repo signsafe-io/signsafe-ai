@@ -114,7 +114,25 @@ async def _download_and_extract_paragraphs(
 async def _split_clauses_with_llm(
     paragraphs: list[Any],
 ) -> list[Any]:
-    """Use LLM to detect clause boundaries; fall back to regex on failure."""
+    """Use LLM to detect clause boundaries; fall back to regex on failure.
+
+    Fast path: if the regex pass already finds ≥2 clauses (the common case
+    after the sub-split fix), the LLM call (3-5 s) is skipped entirely.
+    """
+    # Fast path: regex first — if sufficient, skip the LLM round-trip.
+    regex_clauses = parser_svc._split_into_clauses_regex(paragraphs)
+    if len(regex_clauses) >= 2:
+        log.info(
+            "regex found sufficient clauses — skipping LLM boundary detection",
+            clause_count=len(regex_clauses),
+        )
+        return regex_clauses
+
+    # Regex found 0-1 clause — structure is ambiguous; try LLM for better segmentation.
+    log.info(
+        "regex found few clauses — attempting LLM boundary detection",
+        regex_clause_count=len(regex_clauses),
+    )
     paragraph_texts = [text for text, _, _ in paragraphs]
 
     try:
@@ -134,10 +152,9 @@ async def _split_clauses_with_llm(
             error=str(exc),
         )
 
-    # Regex fallback
-    clauses = parser_svc._split_into_clauses_regex(paragraphs)
-    log.info("regex fallback clause split complete", clause_count=len(clauses))
-    return clauses
+    # Regex fallback (reuse already-computed result)
+    log.info("using regex clause split", clause_count=len(regex_clauses))
+    return regex_clauses
 
 
 def _build_clause_dicts(
