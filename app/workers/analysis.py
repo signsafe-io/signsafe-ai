@@ -525,3 +525,34 @@ def make_handler(
             raise  # re-raise; queue.consume retries or nacks → DLQ
 
     return handler
+
+
+def make_dlq_handler(
+    pool: asyncpg.Pool,
+) -> Callable[[dict[str, Any]], Awaitable[None]]:
+    """Return a DLQ callback that marks the analysis as failed in the DB.
+
+    Called by consume_dlq for every message that could not be processed after
+    all retries.  Idempotent: an analysis that is already 'failed' stays 'failed'.
+    """
+
+    async def on_dlq_message(msg: dict[str, Any]) -> None:
+        analysis_id = msg.get("analysisId")
+        if not analysis_id:
+            log.warning("analysis DLQ message missing analysisId", msg=str(msg)[:200])
+            return
+        try:
+            await update_risk_analysis(
+                pool,
+                analysis_id,
+                status="failed",
+                error_message="DLQ: 최대 재시도 횟수 초과",
+            )
+            log.info("analysis DLQ: analysis marked failed", analysis_id=analysis_id)
+        except Exception:
+            log.exception(
+                "analysis DLQ: failed to update analysis status",
+                analysis_id=analysis_id,
+            )
+
+    return on_dlq_message
