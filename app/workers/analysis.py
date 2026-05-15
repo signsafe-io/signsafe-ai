@@ -27,6 +27,7 @@ Error classification:
 from __future__ import annotations
 
 import asyncio
+import re as _re
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -52,6 +53,36 @@ from app.services.llm import (
 )
 
 log = structlog.get_logger()
+
+_HEADER_PATTERN = _re.compile(
+    r"^(제\s*\d+\s*[조항목절]"
+    r"|제\s*[일이삼사오육칠팔구십백]+\s*[조항목절]"
+    r"|\d+\.\s"
+    r"|Article\s+\d+"
+    r"|Section\s+\d+"
+    r"|Clause\s+\d+)",
+    _re.IGNORECASE,
+)
+
+
+def _extract_rag_query(clause_text: str, max_chars: int = 400) -> str:
+    """Return the clause body (skipping the header line) for RAG embedding.
+
+    If the first line is a clause header (제N조, Article N, etc.), it is
+    excluded so that the embedding reflects the substantive content rather
+    than the title. Falls back to the full text when the clause has no header.
+    """
+    lines = clause_text.strip().splitlines()
+    if not lines:
+        return clause_text[:max_chars]
+
+    first = lines[0].strip()
+    if _HEADER_PATTERN.match(first) and len(lines) > 1:
+        body = "\n".join(lines[1:]).strip()
+        return body[:max_chars] if body else clause_text[:max_chars]
+
+    return clause_text[:max_chars]
+
 
 _MAX_CONCURRENCY = 5
 # Total timeout per clause: LLM (60 s) + RAG + DB writes.
@@ -159,10 +190,10 @@ async def _analyze_single_clause(
 
         log.info("analyzing clause", clause_id=clause_id, label=label)
 
-        # Step 1: RAG 먼저 — 조항 앞부분(헤더+첫 문장)으로 관련 판례/법령 검색.
-        # 전체 조항 텍스트 대신 앞 300자를 사용해 핵심 주제가 임베딩에 집중되도록 함.
-        # 검색 결과는 LLM 프롬프트에 주입되어 AI가 실제 판례 근거로 분석하게 함.
-        rag_query_text = clause_text[:300]
+        # Step 1: RAG 먼저 — 조항 본문(헤더 제외)으로 관련 판례/법령 검색.
+        # 첫 줄이 "제N조" 같은 헤더인 경우 두 번째 줄부터 사용해 본문 내용으로 검색.
+        # 헤더만으로 검색하면 관련 없는 판례가 반환되므로 본문 우선 사용.
+        rag_query_text = _extract_rag_query(clause_text)
         legal_refs = await rag_svc.search_legal_references(
             query_text=rag_query_text,
             top_k=5,
