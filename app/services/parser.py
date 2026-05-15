@@ -116,6 +116,18 @@ def _sub_split_block(
 # ---------------------------------------------------------------------------
 
 
+def _merge_anchors(anchors: list[Anchor]) -> Anchor | None:
+    """여러 단락의 anchor를 합쳐 전체를 감싸는 bounding box를 반환."""
+    valid = [a for a in anchors if a is not None]
+    if not valid:
+        return None
+    x0 = min(a.x for a in valid)
+    y0 = min(a.y for a in valid)
+    x1 = max(a.x + a.width for a in valid)
+    y1 = max(a.y + a.height for a in valid)
+    return Anchor(x=x0, y=y0, width=x1 - x0, height=y1 - y0)
+
+
 def _extract_label(text: str) -> str | None:
     first_line = text.strip().split("\n")[0].strip()
     if len(first_line) <= 100:
@@ -276,16 +288,24 @@ def clauses_from_boundaries(
 
         lines = [t for t, _, _ in chunk if t.strip()]
         pages = [p for _, p, _ in chunk]
-        first_anchor = next((a for _, _, a in chunk if a is not None), None)
         page_start = pages[0] if pages else 1
         page_end = pages[-1] if pages else 1
+
+        # 같은 페이지(page_start) 단락들의 anchor를 합쳐 조항 전체를 감싸는 bbox 계산.
+        # first_anchor만 사용하면 헤더 텍스트 블록 좌표만 저장되어 하이라이트가 제목만 감쌈.
+        first_anchor = _merge_anchors(
+            [a for _, p, a in chunk if a is not None and p == page_start]
+        )
 
         # Merge carry-over from previous too-short chunk.
         if carry_lines:
             lines = carry_lines + lines
             page_start = carry_page_start
             page_end = max(carry_page_end, page_end)
-            first_anchor = carry_anchor or first_anchor
+            # 캐리오버 anchor와 현재 anchor를 합쳐 전체 범위 유지
+            first_anchor = _merge_anchors(
+                [a for a in [carry_anchor, first_anchor] if a is not None]
+            ) or first_anchor
             # Carry-over label takes priority (it was the actual clause header).
             label = carry_label or label
             carry_lines = []
@@ -305,7 +325,9 @@ def clauses_from_boundaries(
             carry_label = effective_label
             carry_page_start = page_start
             carry_page_end = page_end
-            carry_anchor = first_anchor
+            carry_anchor = _merge_anchors(
+                [a for a in [carry_anchor, first_anchor] if a is not None]
+            ) or first_anchor
             continue
 
         # Normal path: write out (splitting oversized clauses if needed).
